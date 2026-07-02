@@ -1,0 +1,4 @@
+# terva.sh/terva v0.112.0
+## explicit; go 1.22
+terva.sh/terva/packages/agent/ext
+terva.sh/terva/packages/agent/extproto

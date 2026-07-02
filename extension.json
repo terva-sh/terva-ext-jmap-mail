@@ -1,0 +1,52 @@
+{
+  "name": "jmap-mail",
+  "version": "0.10.1",
+  "exec": "./run.sh",
+  "language": "go",
+  "description": "Read, search, and safely organize mail over JMAP providers such as Fastmail.",
+  "enabled": true,
+  "config": [
+    {
+      "key": "session_url",
+      "label": "JMAP session URL",
+      "type": "string",
+      "default": "https://api.fastmail.com/jmap/session",
+      "description": "Provider JMAP session resource. Fastmail: https://api.fastmail.com/jmap/session"
+    },
+    {
+      "key": "api_token",
+      "label": "JMAP API token",
+      "type": "secret",
+      "required": true,
+      "description": "Bearer token for JMAP. Fastmail: Settings → Privacy & Security → Manage API tokens. Stored plaintext in user config; treat as a credential."
+    },
+    {
+      "key": "default_account",
+      "label": "Default account id or name",
+      "type": "string",
+      "description": "Optional JMAP account id or account name/email. Empty: use the provider's primary mail account."
+    },
+    {
+      "key": "max_body_bytes",
+      "label": "Max body bytes per email",
+      "type": "int",
+      "default": 12000,
+      "description": "Upper bound on body text fetched per message (capped at 1,000,000). Tool calls may request less, never more."
+    },
+    {
+      "key": "enable_sieve_tools",
+      "label": "Enable sieve filter tools",
+      "type": "bool",
+      "default": false,
+      "description": "Offer the email_sieve_* tools: a local, versioned store for managing sieve mail filters (with the sieve-rules skill). Off by default; local-only either way."
+    },
+    {
+      "key": "access_level",
+      "label": "Access level",
+      "type": "select",
+      "options": ["read-only", "read-organize", "read-organize-destroy"],
+      "default": "read-only",
+      "description": "read-only: search/fetch only. read-organize: adds mark/move/trash. read-organize-destroy: adds permanent destroy. Tools above the level are withdrawn from the model. The local sieve tools follow enable_sieve_tools instead."
+    }
+  ]
+}

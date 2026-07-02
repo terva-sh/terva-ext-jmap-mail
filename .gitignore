@@ -1,0 +1,3 @@
+# build output (the launcher's binary; exec target of run.sh)
+/jmap-mail
+/bin/
