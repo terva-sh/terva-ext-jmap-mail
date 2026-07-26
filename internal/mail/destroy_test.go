@@ -109,7 +109,20 @@ func TestDestroyDryRun(t *testing.T) {
 		t.Errorf("would-destroy = %+v", res.Destroyed)
 	}
 	if len(res.NotInTrash) != 1 || res.NotInTrash[0].ID != "e-inbox" {
-		t.Errorf("notInTrash = %+v", res.NotInTrash)
+		t.Fatalf("notInTrash = %+v", res.NotInTrash)
+	}
+	// The gate refused BECAUSE of where the message is, and the check already
+	// read that. Reporting "not in Trash" without saying where leaves the
+	// caller to fetch it again before it can pick a remedy — on the one tool
+	// whose mistakes cannot be undone.
+	blocked := res.NotInTrash[0].Mailboxes
+	if len(blocked) != 1 || blocked[0].ID != "mb-inbox" || blocked[0].Name == "" {
+		t.Errorf("notInTrash mailboxes = %+v, want the inbox, identified and named", blocked)
+	}
+	// Candidates carry no placement: they are in Trash by definition, so it
+	// would be bytes restating the gate that let them through.
+	if len(res.Destroyed[0].Mailboxes) != 0 {
+		t.Errorf("destroy candidate carries a redundant placement: %+v", res.Destroyed[0])
 	}
 	if len(res.NotFound) != 1 || res.NotFound[0] != "e-gone" {
 		t.Errorf("notFound = %v", res.NotFound)
@@ -131,6 +144,10 @@ func TestDestroyTrashGate(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "e-inbox") || !strings.Contains(err.Error(), "email_trash") {
 		t.Fatalf("err = %v, want refusal naming the blocker and the alternative", err)
+	}
+	// And where the blocker actually is, since that is what decides the remedy.
+	if !strings.Contains(err.Error(), "Inbox") || !strings.Contains(err.Error(), "mb-inbox") {
+		t.Errorf("refusal %v does not say where the blocker is", err)
 	}
 
 	// allowNotInTrash overrides the gate (confirm still required).

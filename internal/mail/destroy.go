@@ -60,6 +60,14 @@ type DestroyParams struct {
 type DestroyChange struct {
 	ID      string `json:"id"`
 	Subject string `json:"subject,omitempty"`
+	// Mailboxes is set only on NotInTrash entries, where the gate refused
+	// BECAUSE of where the message is: the check already read the placement,
+	// and the remedy differs by what it finds — a message sitting in Inbox
+	// needs email_trash, one in Trash AND Archive needs the other label off.
+	// Saying "not (only) in Trash" without saying where is an answer the
+	// caller has to make a second call to use, on the one tool that cannot be
+	// undone.
+	Mailboxes []MailboxRef `json:"mailboxes,omitempty"`
 }
 
 // DestroyResult is the email_destroy output.
@@ -150,6 +158,7 @@ func (s *Service) Destroy(ctx context.Context, p DestroyParams) (*DestroyResult,
 		// "In Trash" means Trash is the message's only mailbox — a message
 		// still filed elsewhere has not been deleted-to-trash (RFC 8621 §4.6).
 		if !p.AllowNotInTrash && !(len(e.MailboxIDs) == 1 && e.MailboxIDs[trashID]) {
+			change.Mailboxes = s.mailboxRefsByID(ctx, sess, accountID, e.MailboxIDs)
 			blockers = append(blockers, change)
 		} else {
 			candidates = append(candidates, change)
@@ -170,12 +179,14 @@ func (s *Service) Destroy(ctx context.Context, p DestroyParams) (*DestroyResult,
 		return result, nil
 	}
 	if len(blockers) > 0 {
-		var ids []string
+		// Name where each blocker actually is: "not in Trash" alone leaves the
+		// caller to fetch the placement before it can pick a remedy.
+		var where []string
 		for _, b := range blockers {
-			ids = append(ids, b.ID)
+			where = append(where, fmt.Sprintf("%s in %s", b.ID, mailboxLabels(b.Mailboxes)))
 		}
 		return nil, fmt.Errorf("refusing to destroy: %d of %d targets are not (only) in Trash (%s) — move them with email_trash first, or set allowNotInTrash:true to destroy regardless",
-			len(blockers), len(p.IDs), strings.Join(ids, ", "))
+			len(blockers), len(p.IDs), strings.Join(where, "; "))
 	}
 	if len(candidates) == 0 {
 		return result, nil // nothing found to destroy; NotFound tells the story

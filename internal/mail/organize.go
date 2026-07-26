@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -89,10 +90,12 @@ type MarkResult struct {
 	// come back and at what offset.
 	Selection *SelectionUse `json:"selection,omitempty"`
 	// Drifted names messages whose keyword state at apply time differed from
-	// what the dry run recorded. Never abridged: drift is rare, and when it
-	// happens the ids are the answer.
-	Drifted   []string `json:"drifted,omitempty"`
-	DriftNote string   `json:"driftNote,omitempty"`
+	// what the dry run recorded, with both states. Never abridged: drift is
+	// rare, so the one moment it costs bytes is the moment they are worth
+	// paying — withholding the states would send the caller back for the
+	// comparison that detected the drift in the first place.
+	Drifted   []DriftedKeyword `json:"drifted,omitempty"`
+	DriftNote string           `json:"driftNote,omitempty"`
 	// Replayed marks a result returned from a receipt that had already been
 	// applied — nothing was re-sent to the provider.
 	Replayed  bool   `json:"replayed,omitempty"`
@@ -231,7 +234,11 @@ func (s *Service) markInto(ctx context.Context, sess *jmap.Session, accountID st
 		result.snapshot[e.ID] = keywordKey(e.Keywords, action.keyword)
 	}
 	if r := ts.receipt; r != nil {
-		result.Drifted = driftedIDs(r.Snapshot, r.IDs, result.snapshot)
+		for _, d := range driftedStates(r.Snapshot, r.IDs, result.snapshot) {
+			result.Drifted = append(result.Drifted, DriftedKeyword{
+				ID: d.ID, Keyword: action.keyword, Was: d.Was, Now: d.Now,
+			})
+		}
 		if len(result.Drifted) > 0 {
 			result.DriftNote = driftNote
 		}
@@ -292,8 +299,40 @@ type MoveChange struct {
 	From    []MailboxRef `json:"from,omitempty"`
 }
 
+// DriftedPlacement is one message whose mailboxes changed between an
+// email_move / email_trash dry run and its apply, with both placements. The
+// drift is detected by comparing them, so reporting the bare id would send the
+// caller back to email_get for what this result already knows — and the
+// remedy depends on where the message actually went.
+type DriftedPlacement struct {
+	ID  string       `json:"id"`
+	Was []MailboxRef `json:"was"` // where the dry run saw it
+	Now []MailboxRef `json:"now"` // where this run found it, before acting
+}
+
+// DriftedKeyword is the email_mark equivalent: the keyword the action turns on
+// or off, and its state at preview and at apply.
+type DriftedKeyword struct {
+	ID      string `json:"id"`
+	Keyword string `json:"keyword"`
+	Was     string `json:"was"` // set | unset
+	Now     string `json:"now"`
+}
+
+// MailboxCount is a mailbox with a message count — the source-side
+// counterpart of a MoveResult's Destination, deliberately in the same shape.
+// A count keyed by display name would be a weaker identifier than the one the
+// destination gets: JMAP names are user-editable and not unique across
+// parents, so a result carrying only names cannot assert where mail came from
+// without a separate email_list_mailboxes to resolve them, and it degrades
+// silently if one is renamed mid-wave.
+type MailboxCount struct {
+	MailboxRef
+	Count int `json:"count"`
+}
+
 // MoveResult is the email_move / email_trash output. Moved is omitted on bulk
-// runs (see enumerateChanges); MovedCount and the MovedFrom breakdown always
+// runs (see enumerateChanges); MovedCount and the Sources breakdown always
 // stand, and Failed/NotFound are never abridged.
 type MoveResult struct {
 	AccountID       string     `json:"accountId"`
@@ -302,12 +341,17 @@ type MoveResult struct {
 	Destination     MailboxRef `json:"destination"`
 	KeptInMailboxes bool       `json:"keptInMailboxes,omitempty"`
 	MovedCount      int        `json:"movedCount"`
-	// MovedFrom counts by source mailbox (display path). A message in several
-	// mailboxes counts once per mailbox, so the total may exceed MovedCount.
-	MovedFrom map[string]int    `json:"movedFrom,omitempty"`
-	Moved     []MoveChange      `json:"moved,omitempty"`
-	Failed    map[string]string `json:"failed,omitempty"`
-	NotFound  []string          `json:"notFound,omitempty"`
+	// Sources counts by origin mailbox, identified the same way Destination is.
+	// A message in several mailboxes counts once per mailbox, so the total may
+	// exceed MovedCount. Ordered by count descending, so the mailbox a batch
+	// mostly came from reads first; ties break on path then id, so the same
+	// move always renders the same bytes. This is the whole of the source
+	// information on a bulk run, where Moved (and the per-message From refs
+	// inside it) is omitted.
+	Sources  []MailboxCount    `json:"sources,omitempty"`
+	Moved    []MoveChange      `json:"moved,omitempty"`
+	Failed   map[string]string `json:"failed,omitempty"`
+	NotFound []string          `json:"notFound,omitempty"`
 
 	// ReceiptID is minted by a dry run: present it to the real run in place of
 	// the ids AND the confirm phrase.
@@ -317,10 +361,12 @@ type MoveResult struct {
 	// come back and at what offset.
 	Selection *SelectionUse `json:"selection,omitempty"`
 	// Drifted names messages that were somewhere other than where the dry run
-	// saw them. Never abridged: drift is rare, and when it happens the ids are
-	// the answer.
-	Drifted   []string `json:"drifted,omitempty"`
-	DriftNote string   `json:"driftNote,omitempty"`
+	// saw them, with both placements. Never abridged: drift is rare, so the one
+	// moment it costs bytes is the moment they are worth paying — withholding
+	// the placements would send the caller back for the comparison that
+	// detected the drift in the first place.
+	Drifted   []DriftedPlacement `json:"drifted,omitempty"`
+	DriftNote string             `json:"driftNote,omitempty"`
 	// Replayed marks a result returned from a receipt that had already been
 	// applied — nothing was re-sent to the provider.
 	Replayed  bool   `json:"replayed,omitempty"`
@@ -540,10 +586,17 @@ func (s *Service) moveInto(ctx context.Context, sess *jmap.Session, accountID st
 		return nil, fmt.Errorf("parse Email/get response: %v", err)
 	}
 
+	destRef := MailboxRef{ID: dest.ID, Name: dest.Name, Role: dest.Role}
+	// Path only when it says something the name does not — the same rule
+	// mailboxRefsByID applies, and the reason the confirm phrase quotes the
+	// path rather than the name.
+	if dest.Path != dest.Name {
+		destRef.Path = dest.Path
+	}
 	result := &MoveResult{
 		AccountID:       accountID,
 		DryRun:          dryRun,
-		Destination:     MailboxRef{ID: dest.ID, Name: dest.Name, Role: dest.Role},
+		Destination:     destRef,
 		KeptInMailboxes: keep,
 		NotFound:        got.NotFound,
 		snapshot:        make(map[string]string, len(got.List)),
@@ -555,8 +608,8 @@ func (s *Service) moveInto(ctx context.Context, sess *jmap.Session, accountID st
 	// snapshot is pre-mutation on both the preview and the apply — like for
 	// like. A difference means something else moved the message in between.
 	if r := ts.receipt; r != nil {
-		result.Drifted = driftedIDs(r.Snapshot, r.IDs, result.snapshot)
-		if len(result.Drifted) > 0 {
+		if drift := driftedStates(r.Snapshot, r.IDs, result.snapshot); len(drift) > 0 {
+			result.Drifted = s.annotateDrift(ctx, sess, accountID, drift)
 			result.DriftNote = driftNote
 		}
 	}
@@ -569,6 +622,7 @@ func (s *Service) moveInto(ctx context.Context, sess *jmap.Session, accountID st
 		result.Failed, setNotFound = outcome.failures()
 		result.NotFound = mergeNotFound(result.NotFound, setNotFound)
 	}
+	sources := map[string]*MailboxCount{}
 	for _, e := range got.List {
 		if outcome != nil && !outcome.updatedOK(e.ID) {
 			continue // reported in Failed
@@ -576,16 +630,76 @@ func (s *Service) moveInto(ctx context.Context, sess *jmap.Session, accountID st
 		from := s.mailboxRefsByID(ctx, sess, accountID, e.MailboxIDs)
 		result.MovedCount++
 		for _, ref := range from {
-			if result.MovedFrom == nil {
-				result.MovedFrom = map[string]int{}
+			// Keyed by id, which is what makes the breakdown an assertion
+			// rather than an inference; the name rides along for reading.
+			if sources[ref.ID] == nil {
+				sources[ref.ID] = &MailboxCount{MailboxRef: ref}
 			}
-			result.MovedFrom[mailboxKey(ref)]++
+			sources[ref.ID].Count++
 		}
 		if enumerate {
 			result.Moved = append(result.Moved, MoveChange{ID: e.ID, Subject: e.Subject, From: from})
 		}
 	}
+	result.Sources = sortedSources(sources)
 	return result, nil
+}
+
+// annotateDrift turns the raw placement keys into named mailboxes, resolving
+// every mailbox the drift mentions in ONE pass. Per-message resolution would
+// be a provider round-trip per drifted message in exactly the case that
+// matters: a mailbox deleted between preview and apply is never in the
+// refreshed list, so it misses the cache every time it is looked up.
+func (s *Service) annotateDrift(ctx context.Context, sess *jmap.Session, accountID string, drift []driftPair) []DriftedPlacement {
+	all := map[string]bool{}
+	for _, d := range drift {
+		for id := range placementIDs(d.Was) {
+			all[id] = true
+		}
+		for id := range placementIDs(d.Now) {
+			all[id] = true
+		}
+	}
+	byID := make(map[string]MailboxRef, len(all))
+	for _, ref := range s.mailboxRefsByID(ctx, sess, accountID, all) {
+		byID[ref.ID] = ref
+	}
+	refsFor := func(key string) []MailboxRef {
+		var out []MailboxRef
+		for id := range placementIDs(key) {
+			out = append(out, byID[id])
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+		return out
+	}
+	out := make([]DriftedPlacement, 0, len(drift))
+	for _, d := range drift {
+		out = append(out, DriftedPlacement{ID: d.ID, Was: refsFor(d.Was), Now: refsFor(d.Now)})
+	}
+	return out
+}
+
+// sortedSources renders the source breakdown in a stable, useful order:
+// biggest contributor first, then by the label a reader would sort on, then by
+// id so the bytes never depend on map iteration.
+func sortedSources(m map[string]*MailboxCount) []MailboxCount {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make([]MailboxCount, 0, len(m))
+	for _, mc := range m {
+		out = append(out, *mc)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Count != out[j].Count {
+			return out[i].Count > out[j].Count
+		}
+		if ki, kj := mailboxKey(out[i].MailboxRef), mailboxKey(out[j].MailboxRef); ki != kj {
+			return ki < kj
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
 }
 
 // --- naming a set: ids, selection, or receipt ---
@@ -738,7 +852,7 @@ func checkReceiptDestination(r *receipt, toMailbox string) error {
 // driftNote explains a non-empty Drifted list. The messages are still acted
 // on: the caller named these exact ids, and refusing a whole batch because one
 // message moved would fail far more often than it would help.
-const driftNote = "these messages were somewhere other than where the dry run saw them — something moved them in between. They were still included in this run; check them if the placement mattered."
+const driftNote = "these messages were in a different state than the dry run saw — something changed them in between. They were still included in this run; each entry carries the state at preview and at apply, so no follow-up fetch is needed to see what happened."
 
 // replayMove returns an already-applied move/trash receipt's original result
 // rather than repeating the work. The stored value is copied before the replay
@@ -800,8 +914,10 @@ func trashPhrase(n int, accountID string, ids []string) string {
 
 // --- shared plumbing ---
 
-// mailboxKey labels a mailbox for the MovedFrom breakdown: display path when
-// nested (two folders may share a display name), else name, else id.
+// mailboxKey is the human-readable label for a mailbox: display path when
+// nested (two folders may share a display name), else name, else id. It is a
+// sort key and a phrase fragment — never an identifier, which is why the
+// Sources breakdown is keyed by id and only ordered by this.
 func mailboxKey(r MailboxRef) string {
 	switch {
 	case r.Path != "":
@@ -811,6 +927,24 @@ func mailboxKey(r MailboxRef) string {
 	default:
 		return r.ID
 	}
+}
+
+// mailboxLabels renders a set of mailbox refs for an error message: readable
+// labels, but never bare ids where a name is known, and never a name alone
+// where the id is what makes it checkable.
+func mailboxLabels(refs []MailboxRef) string {
+	if len(refs) == 0 {
+		return "no mailbox"
+	}
+	out := make([]string, 0, len(refs))
+	for _, r := range refs {
+		if label := mailboxKey(r); label != r.ID {
+			out = append(out, fmt.Sprintf("%s (%s)", label, r.ID))
+		} else {
+			out = append(out, r.ID)
+		}
+	}
+	return strings.Join(out, " + ")
 }
 
 func validateIDs(ids []string) error {

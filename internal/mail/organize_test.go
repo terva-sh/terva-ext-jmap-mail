@@ -231,9 +231,13 @@ func TestMoveCountsOnlyAboveThreshold(t *testing.T) {
 	if res.MovedCount != len(ids) {
 		t.Errorf("movedCount = %d, want %d", res.MovedCount, len(ids))
 	}
-	// Keyed by display path: mb-rec2 is a nested namesake of mb-rec1.
-	if res.MovedFrom["Inbox"] != len(ids) || res.MovedFrom["Archive/Receipts"] != 5 {
-		t.Errorf("movedFrom = %v", res.MovedFrom)
+	// The source breakdown is the whole of the origin information on a bulk
+	// run, since Moved (and its per-message From refs) is omitted here.
+	if got := sourceCount(res, "mb-inbox"); got != len(ids) {
+		t.Errorf("sources = %+v, want %d from mb-inbox", res.Sources, len(ids))
+	}
+	if got := sourceCount(res, "mb-rec2"); got != 5 {
+		t.Errorf("sources = %+v, want 5 from the nested Receipts (mb-rec2)", res.Sources)
 	}
 	if want := movePhrase(len(ids), "Archive", "A1", ids); res.ConfirmPhrase != want {
 		t.Errorf("confirmPhrase = %q — the counts form must still hand back the phrase", res.ConfirmPhrase)

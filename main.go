@@ -135,6 +135,12 @@ const contextPolicy = "The email_* tools read and organize the user's mailboxes 
 	"by role (inbox, trash, sent, drafts, junk, archive), display path (Inbox/Gaming), display name, " +
 	"or id; email_list_mailboxes takes a mailboxes selector and a fields projection, so reconciling counts " +
 	"means asking for two folders and three numbers rather than every folder on the account. " +
+	// Display names are user-editable and repeat across parents, so a record
+	// naming a mailbox without its id is an inference that goes wrong silently.
+	// A move result carries the id at both ends so it never has to be.
+	"When recording what a run did, take BOTH mailboxes from the result itself: a move reports destination and sources " +
+	"with the mailbox id beside the name at each end. Do not carry an id forward from an earlier email_list_mailboxes to " +
+	"label later batches — a rename in between leaves a record that is wrong and self-consistent. " +
 	"Email ids are stable across moves. If an expected tool is absent, email_status names the " +
 	"config gate that hides it (and if every email_* tool is missing, jmap-mail itself needs configuring " +
 	"in /extensions). The organization tools (email_mark, " +
@@ -192,7 +198,9 @@ const (
 	descMove = "Move emails to a mailbox (role, path, name, or id), removing them from other mailboxes " +
 		"unless keepInMailboxes is true. " + descTargets +
 		"Supports dryRun; more than 20 ids requires confirm. Runs above 20 " +
-		"report movedCount plus a per-source-mailbox breakdown instead of every message unless verbose:true."
+		"report movedCount plus a per-source-mailbox breakdown instead of every message unless verbose:true. " +
+		"Both ends are identified the same way: destination and each entry in sources carry the mailbox id as well as its name, " +
+		"so the result records where mail went AND where it came from without a separate email_list_mailboxes to resolve a display name."
 
 	descTrash = "Move emails to the Trash mailbox — NOT a permanent delete; mail stays recoverable. " + descTargets +
 		"Supports dryRun; more than 20 ids requires confirm. Runs above 20 report counts instead of every " +
@@ -348,7 +356,7 @@ func schemaMove() json.RawMessage {
     "keepInMailboxes": {"type": "boolean", "default": false, "description": "Add the destination instead of replacing the current mailboxes (label-style)."},
     "dryRun": {"type": "boolean", "default": false, "description": "Report what would move without moving it. Returns a receiptId — prefer applying that over resending ids."},
     "confirm": {"type": "string", "description": "Required above 20 ids unless a receipt is presented: the exact phrase from the refusal message or the dry run's confirmPhrase, verbatim. The phrase is bound to the exact id set, so it cannot confirm a different batch."},
-    "verbose": {"type": "boolean", "description": "List every moved message. Default: lists at or below 20 ids, counts only above it (movedCount plus a per-source-mailbox breakdown; failed/notFound always listed in full). Set true to force the list, false to suppress it."}
+    "verbose": {"type": "boolean", "description": "List every moved message. Default: lists at or below 20 ids, counts only above it (movedCount plus sources, the per-source-mailbox breakdown, each entry carrying the mailbox id and name; failed/notFound always listed in full). Set true to force the list, false to suppress it."}
   }
 }`)
 }

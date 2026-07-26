@@ -198,8 +198,11 @@ func TestIntegrationBulkConfirm(t *testing.T) {
 	if res.MovedCount != 25 || len(res.Moved) != 0 {
 		t.Fatalf("movedCount = %d, moved = %d, want 25 and no enumeration", res.MovedCount, len(res.Moved))
 	}
-	if res.MovedFrom["Inbox"] != 25 {
-		t.Errorf("movedFrom = %v, want 25 from Inbox", res.MovedFrom)
+	if len(res.Sources) != 1 || res.Sources[0].Name != "Inbox" || res.Sources[0].Count != 25 {
+		t.Errorf("sources = %+v, want 25 from Inbox", res.Sources)
+	}
+	if res.Sources[0].ID == "" {
+		t.Error("source mailbox carries no id — the result cannot assert where mail came from on its own")
 	}
 	archived, err := svc.Search(ctx, mail.SearchParams{Mailbox: "archive", From: "bulk@example.test", Limit: 100})
 	if err != nil {

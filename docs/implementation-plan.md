@@ -653,6 +653,115 @@ floor above zero, `hasAttachment` not a boolean. Plus `padding_test.go`, which
 calls each tool with every optional parameter set to its inert value and asserts
 the result equals the unpadded call's.
 
+## Field-report wave 6 (2026-07-26, v0.15.0)
+
+Waves 5 and 6 confirmed v0.14.0 in production on identical work — the same
+4,000 messages in the same twenty batches as Waves 3–4. `email_search` results
+fell 91% (88,568 → 8,179 B), the four-message placement check 72%, all mail
+traffic 63% (128,388 → 47,467 B). One finding came back out of it.
+
+**TW-036: `email_move` identified its destination by id and its source by
+label.** The result carried `destination: {id, name, role}` and
+`movedFrom: {"Inbox": 200}` — a display name and a count. JMAP names are
+user-editable and repeat across parents; ids are neither, which is exactly why
+the destination had the full triple. So a mutation's own output could assert
+where mail went and not where it came from, and every ledger row of the two
+waves asserted ``Inbox `P-F` → Archive `P3V` `` with the source half inferred
+from a baseline `email_list_mailboxes` carried across twenty batches. That is
+sound for a quiescent single-`Inbox` account, and it fails silently: a rename
+between the baseline and batch 10 produces a record that is wrong and
+internally consistent.
+
+Sharper than the report put it: on a bulk run `Moved` is dropped, and the
+per-message `From []MailboxRef` inside it — which *did* carry ids — goes with
+it. The id information existed on the small-run path and was missing exactly
+on the bulk path where the ledger gets written.
+
+- **`movedFrom map[string]int` → `sources []MailboxCount`**, each entry a
+  `MailboxRef` (id, name, path when nested, role) plus a count — the same shape
+  as `Destination`, which is the report's own framing. Replaced rather than
+  added beside: a parallel array would be redundant payload two releases after
+  spending two of them cutting bytes. Ordered by count descending, ties on path
+  then id, so an identical move always renders identical bytes and a committed
+  ledger shows no spurious diff.
+- **`Destination` now carries its `path`** when it differs from the name — the
+  same rule `mailboxRefsByID` applies, and the reason the confirm phrase has
+  always quoted the path rather than the name.
+- **Costs +156 bytes on the 200-message wave** (1,491 → 1,647 B, +10%), all of
+  it on the two move results. Worth it: the alternative is a record that cannot
+  be checked without a second call that was never made.
+
+**The confirm phrase deliberately does not name the source**, against that
+acceptance criterion. The phrase is minted before any provider round-trip that
+could reveal where the messages are, and the real run must recompute the
+identical string to validate it — so embedding the sources costs an extra
+`Email/get` on every bulk call, *including the refusal path whose only output
+is an error*, or splits the atomic `Email/get` + `Email/set` batch and opens a
+drift window the tool itself created. It also buys nothing: the phrase already
+binds the exact id set through `idBatchDigest`, which is strictly stronger — a
+batch may span several mailboxes and one message may sit in several at once, so
+a source name would be lossy where the digest is not. The dry run reports
+`sources` beside `confirmPhrase`, which is where an operator reads them.
+`sources_test.go` pins this as a decision rather than an oversight.
+
+**`email_mark` has no equivalent to fix**, against the report's "same for
+`email_mark`". Marking changes keywords, not placement: `MarkResult` has
+`changedCount`/`alreadySetCount` and `MarkChange{id, subject}`, and no source
+mailbox concept to report. `email_trash` does route through `moveInto` and
+gained `sources` with it.
+
+### The self-review TW-036 prompted
+
+TW-036 is an instance of a rule, so every serialized result was audited against
+it: **a result must be sufficient on its own to say what happened, using
+identifiers that cannot silently change meaning — never a label where the tool
+already holds the id, and never a bare id where the tool already holds the
+state that made it interesting.** Two more instances, neither reported:
+
+- **`Drifted` reported bare ids.** Drift is detected by comparing the placement
+  (or keyword state) the dry run recorded against the one the apply found, and
+  the result threw both away — then told the caller to "check them if the
+  placement mattered", i.e. to fetch what the comparison had just established.
+  Now `[]DriftedPlacement{id, was, now}` for move/trash, with both sides as
+  named `MailboxRef`s, and `[]DriftedKeyword{id, keyword, was, now}` for mark.
+  The payload objection is weakest exactly here: drift is rare and deliberately
+  never abridged, so the one moment it costs bytes is the moment they are worth
+  paying.
+- **`email_destroy`'s in-Trash gate said which messages were blocked, not where
+  they were.** The check reads `mailboxIds` to make its decision and dropped
+  them, on the one tool whose mistakes cannot be undone — and the remedy
+  depends on the answer: a message in Inbox needs `email_trash`, one in Trash
+  *and* Archive needs the other label removed. `NotInTrash` entries now carry
+  their `mailboxes`, and the refusal names them inline. Candidates deliberately
+  do not: they are in Trash by definition, so it would be bytes restating the
+  gate that passed them.
+
+Also fixed while there: the drift annotation resolves every mailbox it mentions
+in **one** pass. Per-message resolution would be a provider round-trip per
+drifted message in precisely the case that matters — a mailbox deleted between
+preview and apply is never in the refreshed list, so it misses the cache on
+every lookup rather than warming it.
+
+Checked and deliberately **not** changed, recorded so they are not re-filed:
+
+- **`SearchResult.Query`'s `inMailbox` is a bare id.** Unlike a move's source,
+  the mailbox was *supplied by the caller*: the arguments say `mailbox: "inbox"`
+  and the result says `inMailbox: "P-F"`, so the record establishes the mapping
+  without inference. Nothing is discovered that the caller does not already
+  hold.
+- **`MarkResult` does not name the keyword** an action maps to. `action:
+  "read"` is the tool's own fixed vocabulary, pinned by a schema enum, so no
+  separate call and no fallible inference stands between the result and a
+  record of it.
+- **`LintResult.FileintoTargets` are mailbox names.** Sieve addresses mailboxes
+  by name; there is no id in a sieve script to report. The cross-check against
+  `email_list_mailboxes` belongs to the caller because the store is
+  zero-network by design.
+- **`Failed`, `NotFound`, `notUpdated`** are keyed by message id with the
+  provider's own reason beside it — already the self-sufficient shape.
+- **The sieve store's `DocKey.Name`** is the identifier: the user chose it,
+  nothing else names the document, and there is no id it could be shadowing.
+
 ## Safety invariants (all phases)
 
 - stdout is the wire; all logging via `Logf`/stderr.

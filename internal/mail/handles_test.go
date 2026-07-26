@@ -352,9 +352,27 @@ func TestReceiptReportsMessagesThatMovedSincePreview(t *testing.T) {
 	if len(applied.Drifted) != 2 {
 		t.Fatalf("drifted = %v, want the two messages that moved", applied.Drifted)
 	}
+	drifted := map[string]DriftedPlacement{}
+	for _, d := range applied.Drifted {
+		drifted[d.ID] = d
+	}
 	for _, id := range moved {
-		if !contains(applied.Drifted, id) {
+		d, ok := drifted[id]
+		if !ok {
 			t.Errorf("drifted list missing %s: %v", id, applied.Drifted)
+			continue
+		}
+		// Both placements come back, so the caller can see what happened
+		// without a second fetch — the comparison that found the drift
+		// already had them.
+		if len(d.Was) != 1 || d.Was[0].ID != "mb-inbox" {
+			t.Errorf("%s was = %+v, want the inbox the dry run saw", id, d.Was)
+		}
+		if len(d.Now) != 1 || d.Now[0].ID != "mb-rec1" {
+			t.Errorf("%s now = %+v, want where it actually is", id, d.Now)
+		}
+		if d.Now[0].Name == "" {
+			t.Errorf("%s now = %+v, want the mailbox named as well as identified", id, d.Now)
 		}
 	}
 	if applied.DriftNote == "" {
@@ -491,8 +509,12 @@ func TestMarkReceiptReportsKeywordDrift(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(applied.Drifted) != 1 || applied.Drifted[0] != read {
-		t.Errorf("drifted = %v, want just %s", applied.Drifted, read)
+	if len(applied.Drifted) != 1 || applied.Drifted[0].ID != read {
+		t.Fatalf("drifted = %+v, want just %s", applied.Drifted, read)
+	}
+	// The keyword and both states, so the drift is legible without refetching.
+	if d := applied.Drifted[0]; d.Keyword != "$seen" || d.Was != "unset" || d.Now != "set" {
+		t.Errorf("drifted = %+v, want $seen unset→set", d)
 	}
 	if applied.AlreadySetCount != 1 || applied.ChangedCount != 24 {
 		t.Errorf("counts = %d changed / %d already set, want 24/1", applied.ChangedCount, applied.AlreadySetCount)

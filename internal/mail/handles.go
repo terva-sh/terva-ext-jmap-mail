@@ -273,11 +273,16 @@ func keywordKey(keywords map[string]bool, keyword string) string {
 	return "unset"
 }
 
-// driftedIDs lists the messages whose state at apply time differs from what
+// driftPair is one message whose state moved between preview and apply, with
+// both states. Drift is detected BY comparing them, so reporting only the id
+// would make the caller re-fetch what this comparison already established.
+type driftPair struct{ ID, Was, Now string }
+
+// driftedStates lists the messages whose state at apply time differs from what
 // the dry run recorded, in the receipt's own id order. Empty when the batch is
 // exactly what was previewed.
-func driftedIDs(snapshot map[string]string, order []string, current map[string]string) []string {
-	var out []string
+func driftedStates(snapshot map[string]string, order []string, current map[string]string) []driftPair {
+	var out []driftPair
 	for _, id := range order {
 		was, previewed := snapshot[id]
 		is, present := current[id]
@@ -287,7 +292,20 @@ func driftedIDs(snapshot map[string]string, order []string, current map[string]s
 			continue
 		}
 		if was != is {
-			out = append(out, id)
+			out = append(out, driftPair{ID: id, Was: was, Now: is})
+		}
+	}
+	return out
+}
+
+// placementIDs reverses placementKey back into the mailbox id set it encodes,
+// so a recorded placement can be annotated with names the same way a live one
+// is. The empty key means "in no mailbox at all", which is a real state.
+func placementIDs(key string) map[string]bool {
+	out := map[string]bool{}
+	for _, id := range strings.Split(key, ",") {
+		if id != "" {
+			out[id] = true
 		}
 	}
 	return out
