@@ -96,8 +96,19 @@ const contextPolicy = "The email_* tools read and organize the user's mailboxes 
 	"truncation, and URLs in them are redacted by default (queries/tokens stripped) — includeFullUrls " +
 	"opts out when the user needs a working link. Search results report hasMore; pass includeTotal for " +
 	"an exact match count (e.g. when sizing a filter rule), and filterJson for raw JMAP AND/OR/NOT " +
-	"filters. For bulk work ask for less: email_search fields:[\"id\"] returns a flat ids array and paging " +
-	"metadata only (and raises the page limit to 500), and organize runs above 20 messages report counts " +
+	"filters. " +
+	// Every message-returning tool takes the same `fields` array. The agent
+	// that reported email_get's missing projection inferred that no projection
+	// existed anywhere, so state the rule once, for all of them.
+	"ASK FOR THE PROPERTIES YOU NEED. email_search, email_get, email_get_thread and email_list_mailboxes all take a " +
+	"fields array projecting the result down to named properties (id is always included; empty means all of them). " +
+	"Checking where a handful of messages landed is email_get fields:[\"mailboxes\",\"keywords\"] — a few hundred bytes, " +
+	"and no third-party sender names, subject lines or body previews pulled into the session record for a placement " +
+	"check that never needed them. " +
+	"For bulk work ask for less again: email_search fields:[\"id\"] returns a flat ids array and paging " +
+	"metadata only (and raises the page limit to 500), returnIds:\"none\" drops even that array once you are working " +
+	"from the selectionId beside it (returnIds:\"boundaries\" keeps the page's first and last id, enough to check " +
+	"placement afterwards), and organize runs above 20 messages report counts " +
 	"instead of enumerating every message (verbose:true restores the list) — a 200-message batch then costs " +
 	"kilobytes, not hundreds. " +
 	// Retyping two hundred ids into a dry run and then into the apply was
@@ -153,10 +164,12 @@ const (
 		"or pass a raw JMAP filter via filterJson (supports AND/OR/NOT). " +
 		"hasMore reports whether matches remain past the page; includeTotal adds an exact match count. " +
 		"fields projects the result down to the properties you need — fields:[\"id\"] for bulk organization, which also raises the page limit to 500. " +
-		"Results carry a selectionId naming the ids: pass it to email_move / email_mark / email_trash as selection instead of retyping them."
+		"Results carry a selectionId naming the ids: pass it to email_move / email_mark / email_trash as selection instead of retyping them — " +
+		"and returnIds:\"none\" then drops the id array entirely, since the handle already names the set (returnIds:\"boundaries\" keeps just the first and last, for checking placement afterwards)."
 
-	descGet = "Fetch up to 20 emails by id with bounded bodies (bodyFormat: text, html, both, or metadata for headers only). " +
-		"Results report body truncation. URL query strings and token-like segments in bodies are redacted by default " +
+	descGet = "Fetch up to 20 emails by id. fields projects the result down to the properties you need — [\"mailboxes\",\"keywords\"] to check where messages landed, " +
+		"with no sender, subject or preview text returned at all; name bodyText or bodyHtml to include a body, or pass no fields and let bodyFormat " +
+		"(text, html, both, metadata) decide as before. Bodies are bounded and results report truncation. URL query strings and token-like segments in bodies are redacted by default " +
 		"(redactedUrls counts them) — pass includeFullUrls only when the task needs a working link."
 
 	descThread = "Fetch a thread's messages, by threadId or any member email id. " +
@@ -210,6 +223,28 @@ const (
 		"Archived documents keep every version on disk and stay listable via includeArchived — nothing is deleted. Local only."
 )
 
+// A note that governs every schema below.
+//
+// Models routinely fill in every declared property rather than omitting keys,
+// so anything the code treats as "unset" must be a value the schema permits,
+// and that value must mean what omitting the key means. Three rules follow:
+//
+//   - No floor that forbids the inert value. `limit` reads 0 as "the default"
+//     and `version` reads 0 as "not chosen", so neither may declare minimum 1;
+//     `ids` on the organize tools reads [] as "not naming ids this way", so it
+//     may not declare minItems 1 (v0.13.0 did, and refused a 2,000-message
+//     wave twenty times over — see targetProperties).
+//   - Every enum admits "". The code already resolves "" to the default, or
+//     refuses it by name; without it in the enum the model gets a schema
+//     violation it never sees the text of, instead of a tool error telling it
+//     what to send.
+//   - No parameter whose padded value is an active choice. hasAttachment is a
+//     string enum rather than a boolean for exactly this reason: a padded
+//     false is a filter excluding every message that has an attachment,
+//     applied silently, with nothing in the result to notice it by.
+//
+// A genuinely required parameter (email_destroy's ids, email_get's ids) is the
+// exception to the first two: there is nothing for the inert value to mean.
 func emptySchema() json.RawMessage {
 	return json.RawMessage(`{"type":"object","properties":{}}`)
 }
@@ -221,7 +256,7 @@ func schemaMailboxes() json.RawMessage {
     "accountId": {"type": "string", "description": "Account id or name; empty for the default account."},
     "includeCounts": {"type": "boolean", "default": true, "description": "Include total/unread message counts. Ignored when fields is set — the projection decides."},
     "mailboxes": {"type": "array", "items": {"type": "string"}, "description": "Return only these mailboxes: role (inbox, archive, ...), path (Inbox/Gaming), display name, or id. Empty returns all of them. A reference matching nothing is an error, never a silently shorter list."},
-    "fields": {"type": "array", "items": {"type": "string", "enum": ["id", "name", "path", "parentId", "role", "sortOrder", "totalEmails", "unreadEmails", "totalThreads", "unreadThreads"]}, "description": "Return only these properties (id is always included); empty = all of them. Reconciling a wave usually wants [\"name\",\"totalEmails\",\"unreadEmails\"] over two named mailboxes rather than every folder on the account."}
+    "fields": {"type": "array", "items": {"type": "string", "enum": ["", "id", "name", "path", "parentId", "role", "sortOrder", "totalEmails", "unreadEmails", "totalThreads", "unreadThreads"]}, "description": "Return only these properties (id is always included); empty = all of them. Reconciling a wave usually wants [\"name\",\"totalEmails\",\"unreadEmails\"] over two named mailboxes rather than every folder on the account."}
   }
 }`)
 }
@@ -241,16 +276,17 @@ func schemaSearch() json.RawMessage {
     "body": {"type": "string"},
     "after": {"type": "string", "description": "receivedAt lower bound, RFC 3339 or YYYY-MM-DD (inclusive)."},
     "before": {"type": "string", "description": "receivedAt upper bound, RFC 3339 or YYYY-MM-DD (exclusive)."},
-    "hasAttachment": {"type": "boolean"},
+    "hasAttachment": {"type": "string", "enum": ["", "yes", "no"], "default": "", "description": "Filter on attachments: yes for only messages carrying one, no for only messages without. \"\" (the default) does not filter. A string rather than a boolean so that \"no filter\" is a value you can send — a padded false would silently exclude every message that has an attachment, with no error to notice."},
     "keyword": {"type": "string", "description": "Require a JMAP keyword, e.g. $seen or $flagged."},
     "notKeyword": {"type": "string", "description": "Exclude a JMAP keyword, e.g. $seen for unread."},
     "filterJson": {"type": "object", "additionalProperties": true, "description": "Raw RFC 8621 Email/query filter (FilterCondition or AND/OR/NOT FilterOperator), e.g. from a Fastmail jmapquery block. Replaces the structured filter params; only mailbox may combine (ANDed in)."},
     "collapseThreads": {"type": "boolean", "default": false, "description": "At most one result per thread."},
     "includeTotal": {"type": "boolean", "default": false, "description": "Also return the exact total match count (may cost the server extra work)."},
-    "fields": {"type": "array", "items": {"type": "string", "enum": ["id", "threadId", "mailboxes", "keywords", "from", "to", "subject", "receivedAt", "sentAt", "hasAttachment", "size", "preview"]}, "description": "Return only these summary properties (id is always included); empty = all of them. Use [\"id\"] for bulk organization — it skips the per-message fetch entirely and returns a flat ids array, by far the cheapest result shape."},
-    "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 20, "description": "Page size. Above 100 requires a fields projection that omits preview; otherwise it is clamped to 100 (the applied value comes back as limit). One 500-id page feeds three mutating calls via selectionId + selectionOffset."},
+    "fields": {"type": "array", "items": {"type": "string", "enum": ["", "id", "threadId", "mailboxes", "keywords", "from", "to", "subject", "receivedAt", "sentAt", "hasAttachment", "size", "preview"]}, "description": "Return only these summary properties (id is always included); empty = all of them. Use [\"id\"] for bulk organization — it skips the per-message fetch entirely and returns a flat ids array, by far the cheapest result shape."},
+    "returnIds": {"type": "string", "enum": ["", "all", "none", "boundaries"], "default": "", "description": "Which matched ids to return. all (the default, and what \"\" means) as today; none returns only the counts, queryState and selectionId — the handle names the set, so on the bulk path the array is redundant with the field that replaced it; boundaries adds firstId and lastId for proving afterwards where a batch began and ended. none and boundaries make fields irrelevant: no per-message property is returned either way."},
+    "limit": {"type": "integer", "minimum": 0, "maximum": 500, "default": 20, "description": "Page size; 0 (or omitted) means the default of 20. Above 100 requires a fields projection that omits preview; otherwise it is clamped to 100 (the applied value comes back as limit). One 500-id page feeds three mutating calls via selectionId + selectionOffset."},
     "position": {"type": "integer", "minimum": 0, "default": 0, "description": "Offset for paging."},
-    "sort": {"type": "string", "enum": ["newest", "oldest"], "default": "newest"}
+    "sort": {"type": "string", "enum": ["", "newest", "oldest"], "default": "newest", "description": "Order by receivedAt; \"\" means newest."}
   }
 }`)
 }
@@ -261,8 +297,9 @@ func schemaGet() json.RawMessage {
   "properties": {
     "accountId": {"type": "string", "description": "Account id or name; empty for the default account."},
     "ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 20},
-    "bodyFormat": {"type": "string", "enum": ["text", "html", "both", "metadata"], "default": "text"},
-    "maxBodyBytes": {"type": "integer", "minimum": 0, "description": "Per-message body byte budget; capped by the configured maximum."},
+    "fields": {"type": "array", "items": {"type": "string", "enum": ["", "id", "threadId", "mailboxes", "keywords", "from", "to", "subject", "receivedAt", "sentAt", "hasAttachment", "size", "preview", "cc", "bcc", "replyTo", "attachments", "bodyText", "bodyHtml"]}, "description": "Return only these properties (id is always included); empty = all of them, as today. This is the whole answer to what you want back, bodies included — name bodyText or bodyHtml to get one, and a projection naming neither returns metadata only whatever bodyFormat says. Checking where messages landed is [\"mailboxes\",\"keywords\"], which returns no sender, subject or preview text at all. Every email_search projection is valid here."},
+    "bodyFormat": {"type": "string", "enum": ["", "text", "html", "both", "metadata"], "default": "text", "description": "Shorthand for callers passing no fields: which bodies to fetch (\"\" means text). Ignored when fields is set."},
+    "maxBodyBytes": {"type": "integer", "minimum": 0, "description": "Per-message body byte budget; capped by the configured maximum. 0 (or omitted) means the configured default."},
     "includeFullUrls": {"type": "boolean", "default": false, "description": "Keep URLs intact (query strings, tokens). Default strips them — use only when the user needs a working link."}
   },
   "required": ["ids"]
@@ -293,7 +330,7 @@ func schemaMark() json.RawMessage {
   "type": "object",
   "properties": {
     "accountId": {"type": "string", "description": "Account id or name; empty for the default account."},` + targetProperties + `
-    "action": {"type": "string", "enum": ["read", "unread", "flag", "unflag"]},
+    "action": {"type": "string", "enum": ["", "read", "unread", "flag", "unflag"], "description": "What to change. Required — \"\" is accepted by the schema only so the refusal comes from the tool, naming the four choices, rather than from schema validation."},
     "dryRun": {"type": "boolean", "default": false, "description": "Report what would change without changing it. Returns a receiptId — prefer applying that over resending ids."},
     "confirm": {"type": "string", "description": "Required above 20 ids unless a receipt is presented: the exact phrase from the refusal message or the dry run's confirmPhrase, verbatim. The phrase is bound to the exact id set, so it cannot confirm a different batch."},
     "verbose": {"type": "boolean", "description": "List every affected message. Default: lists at or below 20 ids, counts only above it (failed/notFound are always listed in full). Set true to force the list, false to suppress it."}
@@ -375,7 +412,7 @@ func schemaSievePut() json.RawMessage {
     "name": {"type": "string", "description": "Document name from first-use calibration, e.g. area-1-after-require-before-generated."},
     "content": {"type": "string", "description": "Full document content. For large provider exports prefer sourcePath."},
     "sourcePath": {"type": "string", "description": "Import content from a file INSIDE the session working directory (large exports survive intact instead of being re-typed). Mutually exclusive with content."},
-    "origin": {"type": "string", "enum": ["paste-in", "edit"], "description": "paste-in: verbatim from the user/provider. edit: an agent change."},
+    "origin": {"type": "string", "enum": ["", "paste-in", "edit"], "description": "paste-in: verbatim from the user/provider. edit: an agent change. Required — \"\" is accepted by the schema only so the refusal comes from the tool, naming both choices, rather than from schema validation."},
     "note": {"type": "string", "description": "One-line reason, shown in history."},
     "contextOnly": {"type": "boolean", "description": "Mark the document as reference material (full exports, generated blocks): kept and diffable, but mark_applied refuses it."},
     "dryRun": {"type": "boolean", "default": false, "description": "Lint and diff against the current head without storing anything."}
@@ -390,7 +427,7 @@ func schemaSieveRestore() json.RawMessage {
   "properties": {
     "accountId": {"type": "string", "description": "Account id; optional when only one account has stored documents."},
     "name": {"type": "string"},
-    "version": {"type": "integer", "minimum": 1, "description": "Version whose content becomes the new head (as a copy)."},
+    "version": {"type": "integer", "minimum": 0, "description": "Version whose content becomes the new head (as a copy). Required — 0 is accepted by the schema only so the refusal comes from the tool rather than from schema validation."},
     "note": {"type": "string"}
   },
   "required": ["name", "version"]
@@ -439,9 +476,9 @@ func schemaThread() json.RawMessage {
     "threadId": {"type": "string", "description": "Thread to fetch. Provide this or emailId."},
     "emailId": {"type": "string", "description": "Any email in the thread. Provide this or threadId."},
     "includeBodies": {"type": "boolean", "default": false, "description": "Also fetch bounded text bodies."},
-    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Messages to return, from the newest end of the thread. Defaults to the cap: 100 summaries, or 20 with includeBodies. count reports the thread's real size and omitted how many older messages were left out — fetch those by id with email_get."},
-    "fields": {"type": "array", "items": {"type": "string", "enum": ["id", "threadId", "mailboxes", "keywords", "from", "to", "subject", "receivedAt", "sentAt", "hasAttachment", "size", "preview"]}, "description": "Return only these summary properties (id is always included). Not valid with includeBodies."},
-    "maxBodyBytes": {"type": "integer", "minimum": 0, "description": "Per-message body byte budget; capped by the configured maximum."},
+    "limit": {"type": "integer", "minimum": 0, "maximum": 100, "description": "Messages to return, from the newest end of the thread; 0 (or omitted) means the cap: 100 summaries, or 20 with includeBodies. count reports the thread's real size and omitted how many older messages were left out — fetch those by id with email_get."},
+    "fields": {"type": "array", "items": {"type": "string", "enum": ["", "id", "threadId", "mailboxes", "keywords", "from", "to", "subject", "receivedAt", "sentAt", "hasAttachment", "size", "preview"]}, "description": "Return only these summary properties (id is always included); empty = all of them. Not valid with includeBodies."},
+    "maxBodyBytes": {"type": "integer", "minimum": 0, "description": "Per-message body byte budget; capped by the configured maximum. 0 (or omitted) means the configured default."},
     "includeFullUrls": {"type": "boolean", "default": false, "description": "Keep URLs intact (query strings, tokens). Default strips them — use only when the user needs a working link."}
   }
 }`)

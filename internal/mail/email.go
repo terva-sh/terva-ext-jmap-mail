@@ -83,28 +83,56 @@ var fieldOrder = []string{
 	"subject", "receivedAt", "sentAt", "hasAttachment", "size", "preview",
 }
 
+// fullFieldOrder extends fieldOrder with the EmailFull-only properties, in
+// struct order. email_get projects over this superset, which makes every
+// projection valid on email_search valid there too — a caller can carry one
+// field list across the two tools — while still being able to name the
+// recipients, attachment list and bodies that only email_get returns.
+var fullFieldOrder = append(append([]string{}, fieldOrder...),
+	"cc", "bcc", "replyTo", "attachments", "bodyText", "bodyHtml")
+
 // fieldProperty maps a projectable field onto the RFC 8621 §4.1 Email
-// property that backs it (identical but for the mailbox annotation, which is
-// computed from mailboxIds).
-var fieldProperty = map[string]string{"mailboxes": "mailboxIds"}
+// property that backs it. Most are identical; mailboxes is computed from
+// mailboxIds, and the two body fields name the part lists whose values
+// email_get fetches separately.
+var fieldProperty = map[string]string{
+	"mailboxes": "mailboxIds",
+	"bodyText":  "textBody",
+	"bodyHtml":  "htmlBody",
+}
 
 // fieldSet is a parsed `fields` projection. nil means no projection at all:
 // every property, byte-identical to the pre-projection behaviour.
 type fieldSet map[string]bool
 
-// parseFields validates the caller's field names. id is always in the set —
-// a summary that cannot be addressed is no use to anyone.
-func parseFields(names []string) (fieldSet, error) {
+// parseFields validates a summary-scoped projection (email_search,
+// email_get_thread).
+func parseFields(names []string) (fieldSet, error) { return parseFieldsIn(names, fieldOrder) }
+
+// parseFullFields validates a projection over the full email_get shape.
+func parseFullFields(names []string) (fieldSet, error) { return parseFieldsIn(names, fullFieldOrder) }
+
+// parseFieldsIn validates the caller's field names against the tool's own
+// vocabulary. id is always in the set — a message that cannot be addressed is
+// no use to anyone.
+func parseFieldsIn(names []string, vocab []string) (fieldSet, error) {
 	if len(names) == 0 {
 		return nil, nil
 	}
-	set := fieldSet{"id": true}
+	set, named := fieldSet{"id": true}, false
 	for _, n := range names {
 		name := strings.TrimSpace(n)
-		if !slices.Contains(fieldOrder, name) {
-			return nil, fmt.Errorf("unknown field %q: choose from %s", n, strings.Join(fieldOrder, ", "))
+		if name == "" {
+			continue // a padded [""] names nothing; treat it as unnamed, not unknown
+		}
+		if !slices.Contains(vocab, name) {
+			return nil, fmt.Errorf("unknown field %q: choose from %s", n, strings.Join(vocab, ", "))
 		}
 		set[name] = true
+		named = true
+	}
+	if !named {
+		return nil, nil // nothing but padding was named: no projection at all
 	}
 	return set, nil
 }
@@ -119,6 +147,10 @@ func (f fieldSet) has(name string) bool { return f == nil || f[name] }
 // already answers on its own, so the Email/get can be skipped entirely.
 func (f fieldSet) idOnly() bool { return f != nil && len(f) == 1 }
 
+// wantsBodies reports whether a projection asks for any body part. Only
+// meaningful on a projected set: without one, bodyFormat decides.
+func (f fieldSet) wantsBodies() bool { return f != nil && (f["bodyText"] || f["bodyHtml"]) }
+
 // properties maps the projection onto the Email/get properties argument, so a
 // projection saves provider bandwidth as well as caller context.
 func (f fieldSet) properties() []string {
@@ -126,7 +158,7 @@ func (f fieldSet) properties() []string {
 		return summaryProperties
 	}
 	out := make([]string, 0, len(f))
-	for _, name := range fieldOrder {
+	for _, name := range fullFieldOrder {
 		if !f[name] {
 			continue
 		}
@@ -251,6 +283,28 @@ func (e rawEmail) summaryWith(mailboxes []MailboxRef, f fieldSet) EmailSummary {
 		s.Preview, _ = redactURLs(e.Preview)
 	}
 	return s
+}
+
+// fullWith builds the email_get shape restricted to a projection (nil =
+// everything, byte-identical to the pre-projection result). Bodies are left to
+// the caller, which owns the byte budget and the URL redaction.
+func (e rawEmail) fullWith(mailboxes []MailboxRef, f fieldSet) EmailFull {
+	full := EmailFull{EmailSummary: e.summaryWith(mailboxes, f)}
+	if f.has("cc") {
+		full.Cc = addresses(e.Cc)
+	}
+	if f.has("bcc") {
+		full.Bcc = addresses(e.Bcc)
+	}
+	if f.has("replyTo") {
+		full.ReplyTo = addresses(e.ReplyTo)
+	}
+	if f.has("attachments") {
+		for _, a := range e.Attachments {
+			full.Attachments = append(full.Attachments, AttachmentInfo{Name: a.Name, Type: a.Type, Size: a.Size})
+		}
+	}
+	return full
 }
 
 // assembleBody concatenates the body parts' fetched values (RFC 8621 §4.2:

@@ -316,19 +316,24 @@ func (a *app) handleSearch(raw json.RawMessage) ext.ToolResult {
 		Body            string          `json:"body"`
 		After           string          `json:"after"`
 		Before          string          `json:"before"`
-		HasAttachment   *bool           `json:"hasAttachment"`
+		HasAttachment   json.RawMessage `json:"hasAttachment"`
 		Keyword         string          `json:"keyword"`
 		NotKeyword      string          `json:"notKeyword"`
 		FilterJSON      json.RawMessage `json:"filterJson"`
 		CollapseThreads bool            `json:"collapseThreads"`
 		IncludeTotal    bool            `json:"includeTotal"`
 		Fields          []string        `json:"fields"`
+		ReturnIDs       string          `json:"returnIds"`
 		Limit           int             `json:"limit"`
 		Position        int             `json:"position"`
 		Sort            string          `json:"sort"`
 	}
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return ext.TextErrorResult("invalid args: " + err.Error())
+	}
+	hasAttachment, err := parseHasAttachment(in.HasAttachment)
+	if err != nil {
+		return ext.TextErrorResult(err.Error())
 	}
 	svc, err := a.service()
 	if err != nil {
@@ -340,9 +345,10 @@ func (a *app) handleSearch(raw json.RawMessage) ext.ToolResult {
 		Account: in.AccountID, Mailbox: in.Mailbox,
 		Text: in.Text, From: in.From, To: in.To, Cc: in.Cc, Bcc: in.Bcc,
 		Subject: in.Subject, Body: in.Body, After: in.After, Before: in.Before,
-		HasAttachment: in.HasAttachment, Keyword: in.Keyword, NotKeyword: in.NotKeyword,
+		HasAttachment: hasAttachment, Keyword: in.Keyword, NotKeyword: in.NotKeyword,
 		FilterJSON: in.FilterJSON, CollapseThreads: in.CollapseThreads, IncludeTotal: in.IncludeTotal,
-		Fields: in.Fields, Limit: in.Limit, Position: in.Position, Sort: in.Sort,
+		Fields: in.Fields, ReturnIDs: in.ReturnIDs,
+		Limit: in.Limit, Position: in.Position, Sort: in.Sort,
 	})
 	if err != nil {
 		return ext.TextErrorResult(err.Error())
@@ -350,10 +356,46 @@ func (a *app) handleSearch(raw json.RawMessage) ext.ToolResult {
 	return jsonResult(result)
 }
 
+// parseHasAttachment reads the tri-state attachment filter. It is declared as
+// a string enum ("" | yes | no) rather than a boolean because a model that
+// pads every declared property would send false — an active filter excluding
+// every message that has an attachment, applied silently with nothing in the
+// result to notice it by. "" is the inert value the schema can express.
+// Booleans are still accepted so a caller working from the older schema, or
+// from habit, is not broken.
+func parseHasAttachment(raw json.RawMessage) (*bool, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		// A JSON null unmarshals into a string as a no-op, so it lands here
+		// as "" — the same "no filter" the padded value means.
+		switch strings.ToLower(strings.TrimSpace(s)) {
+		case "", "any":
+			return nil, nil
+		case "yes", "true":
+			return boolPtr(true), nil
+		case "no", "false":
+			return boolPtr(false), nil
+		default:
+			return nil, fmt.Errorf("hasAttachment %q: use \"yes\" for only messages with an attachment, \"no\" for only messages without, or \"\" to not filter on it", s)
+		}
+	}
+	var b bool
+	if err := json.Unmarshal(raw, &b); err == nil {
+		return &b, nil
+	}
+	return nil, fmt.Errorf("hasAttachment: use \"yes\", \"no\", or \"\" to not filter on it")
+}
+
+func boolPtr(b bool) *bool { return &b }
+
 func (a *app) handleGet(raw json.RawMessage) ext.ToolResult {
 	var in struct {
 		AccountID       string   `json:"accountId"`
 		IDs             []string `json:"ids"`
+		Fields          []string `json:"fields"`
 		BodyFormat      string   `json:"bodyFormat"`
 		MaxBodyBytes    int      `json:"maxBodyBytes"`
 		IncludeFullUrls bool     `json:"includeFullUrls"`
@@ -368,7 +410,7 @@ func (a *app) handleGet(raw json.RawMessage) ext.ToolResult {
 	ctx, cancel := toolCtx()
 	defer cancel()
 	result, err := svc.Get(ctx, mail.GetParams{
-		Account: in.AccountID, IDs: in.IDs, BodyFormat: in.BodyFormat,
+		Account: in.AccountID, IDs: in.IDs, Fields: in.Fields, BodyFormat: in.BodyFormat,
 		MaxBodyBytes: in.MaxBodyBytes, IncludeFullUrls: in.IncludeFullUrls,
 	})
 	if err != nil {

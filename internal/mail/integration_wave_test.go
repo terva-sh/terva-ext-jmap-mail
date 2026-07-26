@@ -61,7 +61,9 @@ func seedWave(t *testing.T, total int) *mail.Service {
 
 // runWave archives an inbox in batches, either retyping the ids into every
 // mutating call or naming them once and referring to them afterwards.
-func runWave(t *testing.T, total int, handles bool) (spent, organized int) {
+// returnIDs is the search's id-return mode: "" leaves the id array in the
+// result as before, "none" drops it, which is only usable on the handle path.
+func runWave(t *testing.T, total int, handles bool, returnIDs string) (spent, organized int) {
 	t.Helper()
 	svc := seedWave(t, total)
 	ctx := context.Background()
@@ -71,10 +73,14 @@ func runWave(t *testing.T, total int, handles bool) (spent, organized int) {
 		"mailbox": "inbox", "from": "news@example.test",
 		"fields": []string{"id"}, "limit": 200,
 	}
+	if returnIDs != "" {
+		searchArgs["returnIds"] = returnIDs
+	}
 	for batch := 0; batch < 10; batch++ {
 		m.sent(searchArgs)
 		page, err := svc.Search(ctx, mail.SearchParams{
-			Mailbox: "inbox", From: "news@example.test", Fields: []string{"id"}, Limit: 200,
+			Mailbox: "inbox", From: "news@example.test", Fields: []string{"id"},
+			ReturnIDs: returnIDs, Limit: 200,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -85,6 +91,9 @@ func runWave(t *testing.T, total int, handles bool) (spent, organized int) {
 		}
 		if page.SelectionID == "" {
 			t.Fatal("search minted no selectionId — the handle path has nothing to name")
+		}
+		if returnIDs == mail.ReturnIDsNone && len(page.IDs) != 0 {
+			t.Fatalf("returnIds:none still returned %d ids", len(page.IDs))
 		}
 
 		var dryParams mail.MoveParams
@@ -143,8 +152,18 @@ func runWave(t *testing.T, total int, handles bool) (spent, organized int) {
 func TestIntegrationBulkWavePayloadBudget(t *testing.T) {
 	const total = 200
 
-	withHandles, _ := runWave(t, total, true)
-	withIDs, _ := runWave(t, total, false)
+	withHandles, _ := runWave(t, total, true, "")
+	withIDs, _ := runWave(t, total, false, "")
+	// TW-032: once the caller works from the handle, the id array beside it is
+	// the last copy of the set still crossing the boundary.
+	handlesOnly, _ := runWave(t, total, true, mail.ReturnIDsNone)
+
+	if handlesOnly >= withHandles {
+		t.Errorf("returnIds:none cost %d bytes against %d with the array — dropping it saved nothing",
+			handlesOnly, withHandles)
+	}
+	t.Logf("200 messages: %d bytes with handles and no id array, %d with handles, %d retyping ids",
+		handlesOnly, withHandles, withIDs)
 
 	if budget := total * maxWaveBytesPerMessage; withHandles > budget {
 		t.Errorf("wave cost %d bytes of tool traffic for %d messages (%d B/message); budget is %d",

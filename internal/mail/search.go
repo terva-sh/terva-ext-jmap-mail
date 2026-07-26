@@ -31,10 +31,21 @@ type SearchParams struct {
 	CollapseThreads bool
 	IncludeTotal    bool
 	Fields          []string // projection: EmailSummary properties to return; empty = all
-	Limit           int
-	Position        int
-	Sort            string // "newest" (default) | "oldest"
+	// ReturnIDs governs whether the matched ids come back at all:
+	// "" / "all" (the default) as today, "none" for the handle and the counts
+	// alone, "boundaries" for the handle plus the page's first and last id.
+	ReturnIDs string
+	Limit     int
+	Position  int
+	Sort      string // "newest" (default) | "oldest"
 }
+
+// Values for SearchParams.ReturnIDs.
+const (
+	ReturnIDsAll        = "all"
+	ReturnIDsNone       = "none"
+	ReturnIDsBoundaries = "boundaries"
+)
 
 // SearchResult is the email_search output: bounded summaries, never bodies.
 type SearchResult struct {
@@ -55,8 +66,17 @@ type SearchResult struct {
 	// message against nineteen for the bare string — on the 200-id pages bulk
 	// organization pages at, that difference is the larger part of the result.
 	// Set only when the projection is exactly ["id"]; Emails is then omitted.
+	// returnIds:"none" omits it too — a selection handle already names the set,
+	// so on the bulk path the array is redundant with the one field that
+	// replaced it.
 	IDs    []string       `json:"ids,omitempty"`
 	Emails []EmailSummary `json:"emails,omitempty"`
+	// FirstID / LastID are the page's boundary ids under
+	// returnIds:"boundaries". A bounded wave proves placement afterwards by
+	// sampling where each batch began and ended, which costs two ids rather
+	// than the two hundred that suppressing the array just saved.
+	FirstID string `json:"firstId,omitempty"`
+	LastID  string `json:"lastId,omitempty"`
 	// SelectionID names this result's ordered id set so a following
 	// email_move / email_mark / email_trash can operate on it without the
 	// caller retransmitting the ids. Minted only when the organization tools
@@ -92,6 +112,17 @@ func (s *Service) Search(ctx context.Context, p SearchParams) (*SearchResult, er
 	fields, err := parseFields(p.Fields)
 	if err != nil {
 		return nil, err
+	}
+	returnIDs, err := parseReturnIDs(p.ReturnIDs)
+	if err != nil {
+		return nil, err
+	}
+	// Suppressing the ids means no per-message property is returned at all, so
+	// the projection cannot also apply — it is overridden rather than in
+	// conflict. Refusing the combination would refuse a caller that padded
+	// fields with [], which is the inert value the schema promises.
+	if returnIDs != ReturnIDsAll {
+		fields = fieldSet{"id": true}
 	}
 
 	limit := p.Limit
@@ -241,8 +272,11 @@ func (s *Service) Search(ctx context.Context, p SearchParams) (*SearchResult, er
 		QueryState: q.QueryState,
 		Emails:     emails,
 	}
-	if fields.idOnly() {
+	if fields.idOnly() && returnIDs == ReturnIDsAll {
 		result.IDs = ids
+	}
+	if returnIDs == ReturnIDsBoundaries && len(ids) > 0 {
+		result.FirstID, result.LastID = ids[0], ids[len(ids)-1]
 	}
 	// Mint a handle for the set so the next mutating call can name it. Only
 	// worth doing when that call is even possible: at read-only access level
@@ -255,6 +289,22 @@ func (s *Service) Search(ctx context.Context, p SearchParams) (*SearchResult, er
 		})
 	}
 	return result, nil
+}
+
+// parseReturnIDs normalizes the id-return mode. "" is deliberately a value
+// rather than an absence: the flag exists to be left alone by a caller that
+// fills every declared property, and its padded form must mean "as today".
+func parseReturnIDs(mode string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", ReturnIDsAll:
+		return ReturnIDsAll, nil
+	case ReturnIDsNone:
+		return ReturnIDsNone, nil
+	case ReturnIDsBoundaries:
+		return ReturnIDsBoundaries, nil
+	default:
+		return "", fmt.Errorf("invalid returnIds %q: use all (the default), none, or boundaries", mode)
+	}
 }
 
 // buildFilter maps params onto one RFC 8621 §4.4.1 FilterCondition (multiple

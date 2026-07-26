@@ -179,7 +179,7 @@ func (s *Service) GetThread(ctx context.Context, p ThreadParams) (*ThreadResult,
 			continue // destroyed between the thread read and the get
 		}
 		if p.IncludeBodies {
-			result.Full = append(result.Full, s.fullEmail(ctx, sess, accountID, e, BodyText, budget, !p.IncludeFullUrls))
+			result.Full = append(result.Full, s.fullEmail(ctx, sess, accountID, e, BodyText, budget, !p.IncludeFullUrls, nil))
 			continue
 		}
 		var refs []MailboxRef

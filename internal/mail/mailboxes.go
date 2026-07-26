@@ -118,13 +118,20 @@ func parseMailboxFields(names []string) (mailboxFieldSet, error) {
 	if len(names) == 0 {
 		return nil, nil
 	}
-	set := mailboxFieldSet{"id": true}
+	set, named := mailboxFieldSet{"id": true}, false
 	for _, n := range names {
 		name := strings.TrimSpace(n)
+		if name == "" {
+			continue // a padded [""] names nothing; treat it as unnamed, not unknown
+		}
 		if !slices.Contains(mailboxFieldOrder, name) {
 			return nil, fmt.Errorf("unknown mailbox field %q: choose from %s", n, strings.Join(mailboxFieldOrder, ", "))
 		}
 		set[name] = true
+		named = true
+	}
+	if !named {
+		return nil, nil // nothing but padding was named: no projection at all
 	}
 	return set, nil
 }
@@ -179,13 +186,23 @@ func (f mailboxFieldSet) apply(mb Mailbox) Mailbox {
 // is an error naming it — silently returning fewer mailboxes than asked for
 // would let a reconciliation compare the wrong numbers.
 func selectMailboxes(list []Mailbox, refs []string) ([]Mailbox, error) {
-	wanted := map[string]bool{}
+	wanted, named := map[string]bool{}, false
 	for _, ref := range refs {
+		// A blank ref names no mailbox, so it is padding rather than a miss —
+		// refusing it would make the selector unusable to a caller that fills
+		// every declared property. [""] therefore reads exactly like [].
+		if strings.TrimSpace(ref) == "" {
+			continue
+		}
 		mb, err := matchMailbox(list, strings.TrimSpace(ref))
 		if err != nil {
 			return nil, err
 		}
 		wanted[mb.ID] = true
+		named = true
+	}
+	if !named {
+		return list, nil
 	}
 	out := make([]Mailbox, 0, len(wanted))
 	for _, mb := range list {

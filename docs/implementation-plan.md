@@ -576,6 +576,83 @@ The general rule, worth applying to anything added later: **when a tool offers
 mutually exclusive parameters, every one of them needs a representable "not this
 one" value, and the schema must permit it.**
 
+## Field-report wave 5 (2026-07-26, v0.14.0)
+
+Two payload findings (TW-032, TW-033) and — because the wave 4 rule had never
+been checked against anything but the tools that produced it — a sweep of every
+schema for the same defect.
+
+**TW-032: the search still returned the ids the handle replaced.** v0.13.0's
+selection handles meant a caller stopped *sending* two hundred ids; it kept
+*receiving* them, because `fields: ["id"]` is the narrowest projection the tool
+had and `id` is always included. Across two waves that was ~4,000 ids into the
+transcript whose only consumer was the `selectionId` printed beside them.
+
+- **`returnIds`** — `""`/`"all"` (today), `"none"` (the handle, the counts, the
+  total and `queryState`, no ids), `"boundaries"` (adds `firstId`/`lastId`, so a
+  bounded wave can still prove afterwards where each batch began and ended).
+- **A string enum rather than the proposed boolean.** One parameter covers all
+  three states, `""` is inert, and there is no interaction rule between two
+  flags to get wrong. The report's own constraint — the flag must default to
+  today's behaviour, so a padded value changes nothing — is what rules out
+  `returnIds: true` as a boolean: the padded `false` would suppress.
+- **It overrides `fields` rather than conflicting with it.** No per-message
+  property is returned either way, so refusing the combination would only refuse
+  a caller that padded `fields` with `[]` — wave 4's mistake, one release later.
+
+Measured on the same 200-message wave the previous two waves used: **1,491 bytes
+of tool traffic, against 4,375 with handles alone and 10,082 retyping ids** — 7
+bytes per message organized, down from 50.
+
+**TW-033: `email_get` had no projection.** It was the only message-returning
+tool without one; `bodyFormat: "metadata"` reads like one and is not, dropping
+bodies while returning every summary property. A four-message placement check
+therefore cost ~3.5KB of third-party sender names, addresses, subject lines and
+previews — untrusted content pulled into a durable session record for a question
+that needed `id`, `mailboxes` and `keywords`.
+
+- **`fields` over a superset of `email_search`'s vocabulary**, adding `cc`,
+  `bcc`, `replyTo`, `attachments`, `bodyText` and `bodyHtml`. A projection valid
+  on the search is valid here, so one list carries across the two tools, and the
+  properties only `email_get` returns are nameable rather than all-or-nothing.
+- **The projection decides the bodies, and `bodyFormat` stops applying.**
+  Refusing the combination the way `email_get_thread` refuses `fields` +
+  `includeBodies` would have been wave 4 again: `includeBodies` defaults to
+  false and is safely padded, but `bodyFormat`'s inert `""` resolves to `text`,
+  so every projected call from a padding model would have been told it conflicts
+  with a body format it never chose.
+- **A projection that omits `mailboxes` skips the `Mailbox/get` behind it** —
+  the one summary property that costs a second provider call.
+
+**The sweep.** Wave 4's rule generalizes past mutually exclusive parameters:
+*anything the code reads as "unset" must be a value the schema permits, and no
+parameter's padded value may be an active choice.* Applying it found five more
+instances, none of which had been reported:
+
+- **`limit` declared `minimum: 1`** on `email_search` and `email_get_thread`,
+  while both handlers read `0` as "the default". Identical in mechanism to the
+  `minItems: 1` that cost Wave 3, and identically silent — the model never sees
+  the text of a schema violation.
+- **Every string enum omitted `""`**, which each handler already resolves to the
+  default (`sort`, `bodyFormat`) or refuses by name (`action`, `origin`). Adding
+  it turns an unreadable validation failure into the tool's own error, which
+  names the choices. `email_sieve_restore`'s `version` got the same treatment
+  for the same reason.
+- **`hasAttachment` was a presence-based boolean** — the one case where the
+  padded value was not merely unrepresentable but *actively wrong*. `false` is a
+  filter excluding every message that has an attachment, applied silently, with
+  nothing in the result to notice it by. It is now a `"" | "yes" | "no"` string;
+  booleans are still accepted so nothing that already works breaks.
+- **Blank entries in `fields` and `mailboxes`** were "unknown field" and
+  "matches nothing" errors. `[""]` now reads exactly like `[]`, as it already
+  did for the organize `ids`.
+
+Pinned by three tests that read the schemas rather than the code, since these
+defects live entirely in JSON strings: no string enum without `""`, no integer
+floor above zero, `hasAttachment` not a boolean. Plus `padding_test.go`, which
+calls each tool with every optional parameter set to its inert value and asserts
+the result equals the unpadded call's.
+
 ## Safety invariants (all phases)
 
 - stdout is the wire; all logging via `Logf`/stderr.
