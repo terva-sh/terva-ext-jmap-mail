@@ -149,6 +149,65 @@ func TestCallHTTPErrorSnippetBounded(t *testing.T) {
 	}
 }
 
+// A gateway that quotes the request's Authorization header into a non-JMAP
+// error body must not reflect the bearer token into the error the tool caller
+// sees. Two placements: comfortably inside the 200-char snippet window, and
+// straddling its boundary (redaction runs before the cut, so a fragment can't
+// survive either).
+func TestCallHTTPErrorRedactsToken(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"inside the window", `{"error": "rejected request with Authorization: Bearer secret-token"}`},
+		{"straddling the cut", strings.Repeat("x", 190) + " Bearer secret-token trailing"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusBadGateway)
+				w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+
+			_, err := c(srv).Call(context.Background(), srv.URL, []string{CapCore}, []Invocation{{Name: "Core/echo", CallID: "c0"}})
+			var he *HTTPError
+			if !errors.As(err, &he) {
+				t.Fatalf("err = %T %v, want HTTPError", err, err)
+			}
+			if strings.Contains(err.Error(), "secret-token") {
+				t.Errorf("token reflected into error text: %s", err.Error())
+			}
+			// A prefix of the token is a leak too, however short.
+			if strings.Contains(err.Error(), "secret-") {
+				t.Errorf("token fragment reflected into error text: %s", err.Error())
+			}
+		})
+	}
+}
+
+// The same scrub covers an echo of a credential we do not hold (an
+// intermediary may quote a rewritten or upstream token) and the free-text
+// detail of a well-formed RFC 8620 §3.6.1 problem.
+func TestErrorTextRedactsForeignBearerAndProblemDetail(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"type": "urn:ietf:params:jmap:error:notRequest", "status": 400, "detail": "upstream rejected Bearer fm1-upstream.credential_value"}`))
+	}))
+	defer srv.Close()
+
+	_, err := c(srv).Call(context.Background(), srv.URL, []string{CapCore}, []Invocation{{Name: "Core/echo", CallID: "c0"}})
+	var re *RequestError
+	if !errors.As(err, &re) {
+		t.Fatalf("err = %T %v, want RequestError", err, err)
+	}
+	if strings.Contains(err.Error(), "fm1-upstream") {
+		t.Errorf("foreign credential reflected into error text: %s", err.Error())
+	}
+	if !strings.Contains(err.Error(), "upstream rejected Bearer [redacted]") {
+		t.Errorf("detail should survive around the redaction: %s", err.Error())
+	}
+}
+
 func TestCallMethodLevelError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

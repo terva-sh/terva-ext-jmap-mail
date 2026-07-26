@@ -2,6 +2,7 @@ package jmap
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -70,13 +71,36 @@ func (e *HTTPError) Error() string {
 	return fmt.Sprintf("jmap server returned HTTP %d: %s", e.StatusCode, e.Snippet)
 }
 
-// snippet bounds free-form response text for inclusion in error messages.
-func snippet(b []byte) string {
+// snippet bounds free-form response text for inclusion in error messages,
+// scrubbing credentials the body echoes back at us. Redaction runs BEFORE the
+// length bound so a cut can only land inside an already-replaced marker,
+// never part-way through a token.
+func snippet(b []byte, secret string) string {
 	s := strings.TrimSpace(string(b))
 	s = strings.Join(strings.Fields(s), " ") // collapse newlines/whitespace
+	s = redactSecrets(s, secret)
 	const max = 200
 	if len(s) > max {
 		s = s[:max] + "…"
 	}
 	return s
+}
+
+// bearerPattern matches an Authorization-header echo, including of a
+// credential we do not hold (an intermediary may quote a rewritten or
+// upstream token). "[redacted]" is not matchable: the class needs a token
+// character right after the space.
+var bearerPattern = regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._~+/=-]+`)
+
+const redactedMark = "[redacted]"
+
+// redactSecrets strips credentials from provider-supplied free text. A
+// provider, proxy, or WAF that echoes the request's Authorization header into
+// an error body would otherwise put the bearer token into an error string —
+// and from there into the tool caller's transcript, logs, and bug reports.
+func redactSecrets(s, secret string) string {
+	if secret != "" {
+		s = strings.ReplaceAll(s, secret, redactedMark)
+	}
+	return bearerPattern.ReplaceAllString(s, "Bearer "+redactedMark)
 }

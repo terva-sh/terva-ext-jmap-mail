@@ -137,6 +137,172 @@ func TestSearchLimitClamped(t *testing.T) {
 	}
 }
 
+// --- field projection (bulk-organization payloads) ---
+
+// projectionFake answers Email/query alone (id-only projections skip the get)
+// or the query+get pair, echoing back only the requested properties the way a
+// server does.
+func projectionFake() *fake {
+	f := &fake{}
+	f.handler = func(calls []jmap.Invocation) *jmap.Response {
+		switch calls[0].Name {
+		case "Mailbox/get":
+			return response(result("Mailbox/get", calls[0].CallID, map[string]any{"list": mailboxFixture}))
+		case "Email/query":
+			qres := result("Email/query", calls[0].CallID, map[string]any{"ids": []string{"e1"}, "position": 0})
+			if len(calls) == 1 {
+				return response(qres)
+			}
+			props := map[string]bool{}
+			for _, p := range argsOfAny(calls[1])["properties"].([]string) {
+				props[p] = true
+			}
+			e := map[string]any{}
+			for k, v := range emailFixture {
+				if props[k] {
+					e[k] = v
+				}
+			}
+			return response(qres, result("Email/get", calls[1].CallID, map[string]any{"list": []any{e}}))
+		}
+		panic("unexpected call " + calls[0].Name)
+	}
+	return f
+}
+
+// The case that matters: ids and nothing else, in one method call.
+func TestSearchIDOnlyProjectionSkipsGet(t *testing.T) {
+	f := projectionFake()
+	s := testService(f)
+	res, err := s.Search(context.Background(), SearchParams{Mailbox: "inbox", Fields: []string{"id"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batch := findBatch(t, f, "Email/query"); len(batch) != 1 {
+		t.Fatalf("batch = %v, want Email/query alone", batch)
+	}
+	if len(res.Emails) != 1 || res.Emails[0].ID != "e1" {
+		t.Fatalf("emails = %+v", res.Emails)
+	}
+	// Nothing but the id may survive into the payload.
+	if got := stringify(res.Emails); got != `[{"id":"e1"}]` {
+		t.Errorf("emails = %s, want ids only", got)
+	}
+}
+
+func TestSearchProjectionNarrowsGetProperties(t *testing.T) {
+	f := projectionFake()
+	s := testService(f)
+	res, err := s.Search(context.Background(), SearchParams{Fields: []string{"subject", "receivedAt"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch := findBatch(t, f, "Email/query")
+	if len(batch) != 2 {
+		t.Fatalf("batch = %v, want query + get", batch)
+	}
+	// The projection maps onto Email/get properties, so the saving is provider
+	// bandwidth too — id is always along for the ride.
+	if props := stringify(argsOf(t, batch[1])["properties"]); props != `["id","subject","receivedAt"]` {
+		t.Errorf("properties = %s", props)
+	}
+	e := res.Emails[0]
+	if e.Subject != "Hello" || e.ReceivedAt == "" {
+		t.Errorf("requested fields missing: %+v", e)
+	}
+	if e.Preview != "" || len(e.From) != 0 || e.ThreadID != "" || e.Size != 0 {
+		t.Errorf("unrequested fields returned: %+v", e)
+	}
+}
+
+// mailboxes is the one projected field with a cost beyond the get: it drives a
+// mailbox annotation lookup, which an id-only caller must not pay for.
+func TestSearchProjectionMailboxAnnotation(t *testing.T) {
+	s := testService(projectionFake())
+	with, err := s.Search(context.Background(), SearchParams{Fields: []string{"mailboxes"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(with.Emails[0].Mailboxes) != 1 || with.Emails[0].Mailboxes[0].Name != "Inbox" {
+		t.Errorf("mailboxes = %+v", with.Emails[0].Mailboxes)
+	}
+	without, err := s.Search(context.Background(), SearchParams{Fields: []string{"subject"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(without.Emails[0].Mailboxes) != 0 {
+		t.Errorf("mailboxes = %+v, want none", without.Emails[0].Mailboxes)
+	}
+}
+
+func TestSearchRejectsUnknownField(t *testing.T) {
+	s := testService(projectionFake())
+	_, err := s.Search(context.Background(), SearchParams{Fields: []string{"id", "bodyText"}})
+	if err == nil || !strings.Contains(err.Error(), `unknown field "bodyText"`) {
+		t.Fatalf("err = %v, want a refusal naming the field", err)
+	}
+	if !strings.Contains(err.Error(), "receivedAt") {
+		t.Errorf("refusal should list the valid fields: %v", err)
+	}
+}
+
+func TestSearchProjectedLimitCap(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		fields []string
+		want   int
+	}{
+		{"unprojected clamps to 100", nil, maxSearchLimit},
+		{"id-only reaches 500", []string{"id"}, maxProjectedSearchLimit},
+		{"preview-free projection reaches 500", []string{"subject", "from"}, maxProjectedSearchLimit},
+		{"projection keeping preview stays at 100", []string{"subject", "preview"}, maxSearchLimit},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := projectionFake()
+			s := testService(f)
+			res, err := s.Search(context.Background(), SearchParams{Fields: tc.fields, Limit: 5000})
+			if err != nil {
+				t.Fatal(err)
+			}
+			q := argsOf(t, findBatch(t, f, "Email/query")[0])
+			if q["limit"] != float64(tc.want+1) { // +1 is the hasMore probe
+				t.Errorf("query limit = %v, want %d", q["limit"], tc.want+1)
+			}
+			if res.Limit != tc.want {
+				t.Errorf("reported limit = %d, want %d", res.Limit, tc.want)
+			}
+		})
+	}
+}
+
+// A server MAY enforce a smaller limit than the one asked for and report it
+// (RFC 8620 §5.5). Reading the truncated probe as "no more matches" would end
+// a paging loop mid-backlog, silently.
+func TestSearchServerCappedLimitStillReportsHasMore(t *testing.T) {
+	const serverCap = 50
+	f := &fake{}
+	f.handler = func(calls []jmap.Invocation) *jmap.Response {
+		ids := make([]string, serverCap)
+		for i := range ids {
+			ids[i] = fmt.Sprintf("e-%d", i)
+		}
+		return response(result("Email/query", calls[0].CallID, map[string]any{
+			"ids": ids, "position": 0, "limit": serverCap,
+		}))
+	}
+	s := testService(f)
+	res, err := s.Search(context.Background(), SearchParams{Fields: []string{"id"}, Limit: 500})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.HasMore {
+		t.Error("hasMore = false — a server-side cap must not read as the end of the results")
+	}
+	if res.Returned != serverCap || res.Limit != serverCap {
+		t.Errorf("returned/limit = %d/%d, want the server's cap %d so paging stays consistent", res.Returned, res.Limit, serverCap)
+	}
+}
+
 func TestSearchRejectsBadInput(t *testing.T) {
 	s := testService(searchFake())
 	if _, err := s.Search(context.Background(), SearchParams{Sort: "sideways"}); err == nil {

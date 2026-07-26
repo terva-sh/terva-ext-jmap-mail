@@ -42,6 +42,7 @@ type MarkParams struct {
 	Action  string // read | unread | flag | unflag
 	DryRun  bool
 	Confirm string
+	Verbose *bool // nil = enumerate only below the bulk threshold
 }
 
 // MarkChange identifies one affected message.
@@ -51,16 +52,20 @@ type MarkChange struct {
 }
 
 // MarkResult is the email_mark output. Changed lists messages whose state
-// differed (and was/would be updated); AlreadySet lists no-ops.
+// differed (and was/would be updated); AlreadySet lists no-ops. The lists are
+// omitted on bulk runs (see enumerateChanges) — the counts always stand, and
+// Failed/NotFound are never abridged.
 type MarkResult struct {
-	AccountID     string            `json:"accountId"`
-	Action        string            `json:"action"`
-	DryRun        bool              `json:"dryRun,omitempty"`
-	ConfirmPhrase string            `json:"confirmPhrase,omitempty"` // on bulk dry runs: the phrase the real run needs
-	Changed       []MarkChange      `json:"changed"`
-	AlreadySet    []MarkChange      `json:"alreadySet,omitempty"`
-	Failed        map[string]string `json:"failed,omitempty"`
-	NotFound      []string          `json:"notFound,omitempty"`
+	AccountID       string            `json:"accountId"`
+	Action          string            `json:"action"`
+	DryRun          bool              `json:"dryRun,omitempty"`
+	ConfirmPhrase   string            `json:"confirmPhrase,omitempty"` // on bulk dry runs: the phrase the real run needs
+	ChangedCount    int               `json:"changedCount"`
+	AlreadySetCount int               `json:"alreadySetCount"`
+	Changed         []MarkChange      `json:"changed,omitempty"`
+	AlreadySet      []MarkChange      `json:"alreadySet,omitempty"`
+	Failed          map[string]string `json:"failed,omitempty"`
+	NotFound        []string          `json:"notFound,omitempty"`
 }
 
 // Mark sets or clears $seen/$flagged. One batched request: Email/get snapshots
@@ -135,7 +140,8 @@ func (s *Service) Mark(ctx context.Context, p MarkParams) (*MarkResult, error) {
 		return nil, fmt.Errorf("parse Email/get response: %v", err)
 	}
 
-	result := &MarkResult{AccountID: accountID, Action: p.Action, DryRun: p.DryRun, NotFound: got.NotFound, Changed: []MarkChange{}}
+	enumerate := enumerateChanges(p.Verbose, len(p.IDs))
+	result := &MarkResult{AccountID: accountID, Action: p.Action, DryRun: p.DryRun, NotFound: got.NotFound}
 	if p.DryRun && len(p.IDs) > bulkConfirmThreshold {
 		result.ConfirmPhrase = phrase
 	}
@@ -154,9 +160,15 @@ func (s *Service) Mark(ctx context.Context, p MarkParams) (*MarkResult, error) {
 		}
 		change := MarkChange{ID: e.ID, Subject: e.Subject}
 		if e.Keywords[action.keyword] == action.set {
-			result.AlreadySet = append(result.AlreadySet, change)
+			result.AlreadySetCount++
+			if enumerate {
+				result.AlreadySet = append(result.AlreadySet, change)
+			}
 		} else {
-			result.Changed = append(result.Changed, change)
+			result.ChangedCount++
+			if enumerate {
+				result.Changed = append(result.Changed, change)
+			}
 		}
 	}
 	return result, nil
@@ -172,6 +184,7 @@ type MoveParams struct {
 	KeepInMailboxes bool   // false (default): destination replaces all mailboxes
 	DryRun          bool
 	Confirm         string
+	Verbose         *bool // nil = enumerate only below the bulk threshold
 }
 
 // MoveChange records one moved message with its origin mailboxes.
@@ -181,16 +194,22 @@ type MoveChange struct {
 	From    []MailboxRef `json:"from,omitempty"`
 }
 
-// MoveResult is the email_move / email_trash output.
+// MoveResult is the email_move / email_trash output. Moved is omitted on bulk
+// runs (see enumerateChanges); MovedCount and the MovedFrom breakdown always
+// stand, and Failed/NotFound are never abridged.
 type MoveResult struct {
-	AccountID       string            `json:"accountId"`
-	DryRun          bool              `json:"dryRun,omitempty"`
-	ConfirmPhrase   string            `json:"confirmPhrase,omitempty"` // on bulk dry runs: the phrase the real run needs
-	Destination     MailboxRef        `json:"destination"`
-	KeptInMailboxes bool              `json:"keptInMailboxes,omitempty"`
-	Moved           []MoveChange      `json:"moved"`
-	Failed          map[string]string `json:"failed,omitempty"`
-	NotFound        []string          `json:"notFound,omitempty"`
+	AccountID       string     `json:"accountId"`
+	DryRun          bool       `json:"dryRun,omitempty"`
+	ConfirmPhrase   string     `json:"confirmPhrase,omitempty"` // on bulk dry runs: the phrase the real run needs
+	Destination     MailboxRef `json:"destination"`
+	KeptInMailboxes bool       `json:"keptInMailboxes,omitempty"`
+	MovedCount      int        `json:"movedCount"`
+	// MovedFrom counts by source mailbox (display path). A message in several
+	// mailboxes counts once per mailbox, so the total may exceed MovedCount.
+	MovedFrom map[string]int    `json:"movedFrom,omitempty"`
+	Moved     []MoveChange      `json:"moved,omitempty"`
+	Failed    map[string]string `json:"failed,omitempty"`
+	NotFound  []string          `json:"notFound,omitempty"`
 }
 
 // Move puts messages into a destination mailbox. By default the destination
@@ -218,7 +237,7 @@ func (s *Service) Move(ctx context.Context, p MoveParams) (*MoveResult, error) {
 	if err := requireConfirm(len(p.IDs), p.DryRun, p.Confirm, phrase); err != nil {
 		return nil, err
 	}
-	res, err := s.moveInto(ctx, sess, accountID, p.IDs, dest, p.KeepInMailboxes, p.DryRun)
+	res, err := s.moveInto(ctx, sess, accountID, p.IDs, dest, p.KeepInMailboxes, p.DryRun, enumerateChanges(p.Verbose, len(p.IDs)))
 	if err == nil && p.DryRun && len(p.IDs) > bulkConfirmThreshold {
 		res.ConfirmPhrase = phrase
 	}
@@ -231,6 +250,7 @@ type TrashParams struct {
 	IDs     []string
 	DryRun  bool
 	Confirm string
+	Verbose *bool // nil = enumerate only below the bulk threshold
 }
 
 // Trash moves messages to the mailbox with role "trash", replacing all other
@@ -251,7 +271,7 @@ func (s *Service) Trash(ctx context.Context, p TrashParams) (*MoveResult, error)
 	if err := requireConfirm(len(p.IDs), p.DryRun, p.Confirm, phrase); err != nil {
 		return nil, err
 	}
-	res, err := s.moveInto(ctx, sess, accountID, p.IDs, dest, false, p.DryRun)
+	res, err := s.moveInto(ctx, sess, accountID, p.IDs, dest, false, p.DryRun, enumerateChanges(p.Verbose, len(p.IDs)))
 	if err == nil && p.DryRun && len(p.IDs) > bulkConfirmThreshold {
 		res.ConfirmPhrase = phrase
 	}
@@ -261,7 +281,7 @@ func (s *Service) Trash(ctx context.Context, p TrashParams) (*MoveResult, error)
 // moveInto is the shared engine: one batched request where Email/get snapshots
 // each message's current mailboxes (the "from" report), then Email/set applies
 // either a whole-mailboxIds replace or an additive patch — skipped on dryRun.
-func (s *Service) moveInto(ctx context.Context, sess *jmap.Session, accountID string, ids []string, dest Mailbox, keep, dryRun bool) (*MoveResult, error) {
+func (s *Service) moveInto(ctx context.Context, sess *jmap.Session, accountID string, ids []string, dest Mailbox, keep, dryRun, enumerate bool) (*MoveResult, error) {
 	calls := []jmap.Invocation{{
 		Name: "Email/get",
 		Args: map[string]any{
@@ -317,7 +337,6 @@ func (s *Service) moveInto(ctx context.Context, sess *jmap.Session, accountID st
 		DryRun:          dryRun,
 		Destination:     MailboxRef{ID: dest.ID, Name: dest.Name, Role: dest.Role},
 		KeptInMailboxes: keep,
-		Moved:           []MoveChange{},
 		NotFound:        got.NotFound,
 	}
 	var outcome *setOutcome
@@ -333,16 +352,35 @@ func (s *Service) moveInto(ctx context.Context, sess *jmap.Session, accountID st
 		if outcome != nil && !outcome.updatedOK(e.ID) {
 			continue // reported in Failed
 		}
-		result.Moved = append(result.Moved, MoveChange{
-			ID:      e.ID,
-			Subject: e.Subject,
-			From:    s.mailboxRefsByID(ctx, sess, accountID, e.MailboxIDs),
-		})
+		from := s.mailboxRefsByID(ctx, sess, accountID, e.MailboxIDs)
+		result.MovedCount++
+		for _, ref := range from {
+			if result.MovedFrom == nil {
+				result.MovedFrom = map[string]int{}
+			}
+			result.MovedFrom[mailboxKey(ref)]++
+		}
+		if enumerate {
+			result.Moved = append(result.Moved, MoveChange{ID: e.ID, Subject: e.Subject, From: from})
+		}
 	}
 	return result, nil
 }
 
 // --- shared plumbing ---
+
+// mailboxKey labels a mailbox for the MovedFrom breakdown: display path when
+// nested (two folders may share a display name), else name, else id.
+func mailboxKey(r MailboxRef) string {
+	switch {
+	case r.Path != "":
+		return r.Path
+	case r.Name != "":
+		return r.Name
+	default:
+		return r.ID
+	}
+}
 
 func validateIDs(ids []string) error {
 	if len(ids) == 0 {
@@ -352,6 +390,20 @@ func validateIDs(ids []string) error {
 		return fmt.Errorf("too many ids (%d): operate on at most %d per call", len(ids), maxSetIDs)
 	}
 	return nil
+}
+
+// enumerateChanges decides whether a result carries its per-message lists.
+// Unset (the default) enumerates small runs, where the list IS the answer,
+// and reports counts above the bulk threshold, where two hundred subject
+// lines are not what the caller is deciding on — and where the payload, paid
+// twice because a bulk run needs a dry run first, is what pushes an agent
+// into a context compaction mid-wave. verbose:true forces the lists back on
+// at any size; verbose:false suppresses them at any size.
+func enumerateChanges(verbose *bool, n int) bool {
+	if verbose != nil {
+		return *verbose
+	}
+	return n <= bulkConfirmThreshold
 }
 
 // requireConfirm gates bulk non-dry runs behind an exact, human-readable

@@ -148,8 +148,12 @@ func (s *Server) emailQuery(args map[string]any) (any, *methodErr) {
 		ids = append(ids, e.ID)
 	}
 	resp := map[string]any{
-		"accountId":           s.AccountID,
-		"queryState":          "query-0",
+		"accountId": s.AccountID,
+		// RFC 8620 §5.5: queryState MUST change when the query's results
+		// change. Deriving it from the mail state is the conservative
+		// reading — it also changes for mutations this query didn't match,
+		// which the spec permits and real servers do.
+		"queryState":          "query-" + s.stateLocked(),
 		"canCalculateChanges": false,
 		"position":            position,
 		"ids":                 ids,

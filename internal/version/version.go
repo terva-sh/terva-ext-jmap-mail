@@ -11,4 +11,4 @@ package version
 // -ldflags "-X terva-ext-jmap-mail/internal/version.Version=..." if goreleaser
 // is added later; source builds (run.sh, just build) report this committed
 // default.
-var Version = "0.10.1"
+var Version = "0.11.0"

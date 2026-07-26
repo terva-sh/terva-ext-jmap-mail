@@ -7,6 +7,7 @@ package mail_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -46,6 +47,17 @@ func ids(emails []mail.EmailSummary) []string {
 		out = append(out, e.ID)
 	}
 	return out
+}
+
+// payloadSize measures a result the way the tool caller pays for it: as the
+// JSON that reaches the transcript.
+func payloadSize(t *testing.T, v any) int {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal result: %v", err)
+	}
+	return len(b)
 }
 
 func TestIntegrationStatus(t *testing.T) {
@@ -238,6 +250,31 @@ func TestIntegrationSearch(t *testing.T) {
 		_, err := svc.Search(ctx, mail.SearchParams{Mailbox: "Spam"})
 		if err == nil || !strings.Contains(err.Error(), "no mailbox matches") {
 			t.Errorf("err = %v", err)
+		}
+	})
+
+	// The bulk-organization shape, against a real server: identical cohort,
+	// ids only, and no Email/get at all.
+	t.Run("id-only projection", func(t *testing.T) {
+		full, err := svc.Search(ctx, mail.SearchParams{Mailbox: "inbox", Limit: 10})
+		if err != nil {
+			t.Fatal(err)
+		}
+		projected, err := svc.Search(ctx, mail.SearchParams{Mailbox: "inbox", Limit: 10, Fields: []string{"id"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := strings.Join(ids(projected.Emails), ","), strings.Join(ids(full.Emails), ","); got != want {
+			t.Fatalf("projected cohort = %s, want %s", got, want)
+		}
+		fullBytes, projectedBytes := payloadSize(t, full), payloadSize(t, projected)
+		if projectedBytes >= fullBytes/4 {
+			t.Errorf("projected payload %d bytes vs full %d — expected a fraction of it", projectedBytes, fullBytes)
+		}
+		for _, e := range projected.Emails {
+			if e.Subject != "" || e.Preview != "" || len(e.From) != 0 || len(e.Mailboxes) != 0 {
+				t.Errorf("projection leaked properties: %+v", e)
+			}
 		}
 	})
 

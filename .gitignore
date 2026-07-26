@@ -1,3 +1,9 @@
 # build output (the launcher's binary; exec target of run.sh)
 /jmap-mail
 /bin/
+
+# local agent/session state. Tracked here rather than in .git/info/exclude so
+# the rule TRAVELS: the release rsync copies dev's working tree, and an
+# exclude that lives only in dev's .git would let this ride into the public
+# commit (the leak scan runs before `git add -A`, so it would not catch it).
+/.claude/

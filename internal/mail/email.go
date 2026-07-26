@@ -1,6 +1,8 @@
 package mail
 
 import (
+	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -73,6 +75,69 @@ var summaryProperties = []string{
 var fullProperties = append(append([]string{}, summaryProperties...),
 	"cc", "bcc", "replyTo", "attachments")
 
+// fieldOrder is every projectable EmailSummary property, by the JSON name a
+// caller names in `fields`, in the struct's own order (so a projection's
+// Email/get properties and the error text listing them stay stable).
+var fieldOrder = []string{
+	"id", "threadId", "mailboxes", "keywords", "from", "to",
+	"subject", "receivedAt", "sentAt", "hasAttachment", "size", "preview",
+}
+
+// fieldProperty maps a projectable field onto the RFC 8621 §4.1 Email
+// property that backs it (identical but for the mailbox annotation, which is
+// computed from mailboxIds).
+var fieldProperty = map[string]string{"mailboxes": "mailboxIds"}
+
+// fieldSet is a parsed `fields` projection. nil means no projection at all:
+// every property, byte-identical to the pre-projection behaviour.
+type fieldSet map[string]bool
+
+// parseFields validates the caller's field names. id is always in the set —
+// a summary that cannot be addressed is no use to anyone.
+func parseFields(names []string) (fieldSet, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+	set := fieldSet{"id": true}
+	for _, n := range names {
+		name := strings.TrimSpace(n)
+		if !slices.Contains(fieldOrder, name) {
+			return nil, fmt.Errorf("unknown field %q: choose from %s", n, strings.Join(fieldOrder, ", "))
+		}
+		set[name] = true
+	}
+	return set, nil
+}
+
+// projected reports whether a projection is in effect at all.
+func (f fieldSet) projected() bool { return f != nil }
+
+// has reports whether the field is wanted; an absent projection wants all.
+func (f fieldSet) has(name string) bool { return f == nil || f[name] }
+
+// idOnly reports the bulk case — ids and nothing else — which Email/query
+// already answers on its own, so the Email/get can be skipped entirely.
+func (f fieldSet) idOnly() bool { return f != nil && len(f) == 1 }
+
+// properties maps the projection onto the Email/get properties argument, so a
+// projection saves provider bandwidth as well as caller context.
+func (f fieldSet) properties() []string {
+	if f == nil {
+		return summaryProperties
+	}
+	out := make([]string, 0, len(f))
+	for _, name := range fieldOrder {
+		if !f[name] {
+			continue
+		}
+		if prop, ok := fieldProperty[name]; ok {
+			name = prop
+		}
+		out = append(out, name)
+	}
+	return out
+}
+
 // rawEmail mirrors the RFC 8621 §4.1 Email object fields we consume.
 type rawEmail struct {
 	ID            string               `json:"id"`
@@ -140,25 +205,52 @@ func keywordList(m map[string]bool) []string {
 }
 
 func (e rawEmail) summary(mailboxes []MailboxRef) EmailSummary {
-	// Previews are server-generated body snippets and routinely open with a
-	// tokened unsubscribe/sign-in URL, so they redact unconditionally — a
-	// summary is never the surface for retrieving a working link (email_get
-	// with includeFullUrls is).
-	preview, _ := redactURLs(e.Preview)
-	return EmailSummary{
-		ID:            e.ID,
-		ThreadID:      e.ThreadID,
-		Mailboxes:     mailboxes,
-		Keywords:      keywordList(e.Keywords),
-		From:          addresses(e.From),
-		To:            addresses(e.To),
-		Subject:       e.Subject,
-		ReceivedAt:    e.ReceivedAt,
-		SentAt:        e.SentAt,
-		HasAttachment: e.HasAttachment,
-		Size:          e.Size,
-		Preview:       preview,
+	return e.summaryWith(mailboxes, nil)
+}
+
+// summaryWith builds a summary restricted to a projection (nil = everything).
+// Every field but id carries omitempty, so an unrequested one simply does not
+// serialize.
+func (e rawEmail) summaryWith(mailboxes []MailboxRef, f fieldSet) EmailSummary {
+	s := EmailSummary{ID: e.ID}
+	if f.has("threadId") {
+		s.ThreadID = e.ThreadID
 	}
+	if f.has("mailboxes") {
+		s.Mailboxes = mailboxes
+	}
+	if f.has("keywords") {
+		s.Keywords = keywordList(e.Keywords)
+	}
+	if f.has("from") {
+		s.From = addresses(e.From)
+	}
+	if f.has("to") {
+		s.To = addresses(e.To)
+	}
+	if f.has("subject") {
+		s.Subject = e.Subject
+	}
+	if f.has("receivedAt") {
+		s.ReceivedAt = e.ReceivedAt
+	}
+	if f.has("sentAt") {
+		s.SentAt = e.SentAt
+	}
+	if f.has("hasAttachment") {
+		s.HasAttachment = e.HasAttachment
+	}
+	if f.has("size") {
+		s.Size = e.Size
+	}
+	if f.has("preview") {
+		// Previews are server-generated body snippets and routinely open with
+		// a tokened unsubscribe/sign-in URL, so they redact unconditionally —
+		// a summary is never the surface for retrieving a working link
+		// (email_get with includeFullUrls is).
+		s.Preview, _ = redactURLs(e.Preview)
+	}
+	return s
 }
 
 // assembleBody concatenates the body parts' fetched values (RFC 8621 §4.2:

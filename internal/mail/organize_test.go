@@ -5,6 +5,7 @@ package mail
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -161,6 +162,171 @@ func TestMoveAmbiguousDestination(t *testing.T) {
 	_, err := s.Move(context.Background(), MoveParams{IDs: []string{"e1"}, ToMailbox: "Receipts"})
 	if err == nil || !strings.Contains(err.Error(), "ambiguous") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// --- result verbosity (bulk-organization payloads) ---
+
+// bulkFake answers with one message per requested id, every fifth also filed
+// under the nested Receipts folder so the movedFrom breakdown has something to
+// disambiguate.
+func bulkFake() *fake {
+	f := &fake{}
+	f.handler = func(calls []jmap.Invocation) *jmap.Response {
+		if calls[0].Name == "Mailbox/get" {
+			return response(result("Mailbox/get", calls[0].CallID, map[string]any{"list": mailboxFixture}))
+		}
+		ids, _ := argsOfAny(calls[0])["ids"].([]string)
+		var results []jmap.InvocationResult
+		list := make([]any, 0, len(ids))
+		for i, id := range ids {
+			boxes := map[string]bool{"mb-inbox": true}
+			if i%5 == 0 {
+				boxes["mb-rec2"] = true
+			}
+			list = append(list, map[string]any{
+				"id": id, "subject": fmt.Sprintf("Bulk %d", i),
+				"keywords": map[string]bool{}, "mailboxIds": boxes,
+			})
+		}
+		results = append(results, result("Email/get", calls[0].CallID, map[string]any{"list": list}))
+		for _, c := range calls[1:] {
+			update, _ := c.Args.(map[string]any)["update"].(map[string]any)
+			updated := map[string]any{}
+			for id := range update {
+				updated[id] = nil
+			}
+			results = append(results, result("Email/set", c.CallID, map[string]any{
+				"updated": updated, "oldState": "s1", "newState": "s2",
+			}))
+		}
+		return response(results...)
+	}
+	return f
+}
+
+func bulkIDs(n int) []string {
+	ids := make([]string, n)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("e-%d", i)
+	}
+	return ids
+}
+
+// Above the bulk threshold the enumeration is dropped by default: the counts
+// are what the caller is deciding on, and the list is what forces a context
+// compaction mid-wave. The confirm phrase must survive the abridgement — it is
+// the whole point of the dry run.
+func TestMoveCountsOnlyAboveThreshold(t *testing.T) {
+	ids := bulkIDs(bulkConfirmThreshold + 1)
+	s := testService(bulkFake())
+	res, err := s.Move(context.Background(), MoveParams{IDs: ids, ToMailbox: "archive", DryRun: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Moved) != 0 {
+		t.Errorf("moved enumerated %d messages, want counts only", len(res.Moved))
+	}
+	if res.MovedCount != len(ids) {
+		t.Errorf("movedCount = %d, want %d", res.MovedCount, len(ids))
+	}
+	// Keyed by display path: mb-rec2 is a nested namesake of mb-rec1.
+	if res.MovedFrom["Inbox"] != len(ids) || res.MovedFrom["Archive/Receipts"] != 5 {
+		t.Errorf("movedFrom = %v", res.MovedFrom)
+	}
+	if res.ConfirmPhrase != "move 21 emails to Archive in account A1" {
+		t.Errorf("confirmPhrase = %q — the counts form must still hand back the phrase", res.ConfirmPhrase)
+	}
+	// The abridged form must not be mistakable for the full one.
+	if payload := stringify(res); strings.Contains(payload, "Bulk 0") {
+		t.Errorf("subjects leaked into the counts form: %s", payload)
+	}
+}
+
+func TestOrganizeVerboseOverrides(t *testing.T) {
+	yes, no := true, false
+	s := testService(bulkFake())
+	ctx := context.Background()
+
+	bulk := bulkIDs(bulkConfirmThreshold + 1)
+	res, err := s.Move(ctx, MoveParams{IDs: bulk, ToMailbox: "archive", DryRun: true, Verbose: &yes})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Moved) != len(bulk) || res.MovedCount != len(bulk) {
+		t.Errorf("verbose:true at %d ids: moved = %d, want the full list", len(bulk), len(res.Moved))
+	}
+
+	small := bulkIDs(3)
+	res, err = s.Move(ctx, MoveParams{IDs: small, ToMailbox: "archive", Verbose: &no})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Moved) != 0 || res.MovedCount != 3 {
+		t.Errorf("verbose:false at 3 ids: moved = %d, movedCount = %d", len(res.Moved), res.MovedCount)
+	}
+
+	// Default at or below the threshold stays the full enumeration.
+	res, err = s.Move(ctx, MoveParams{IDs: small, ToMailbox: "archive"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Moved) != 3 {
+		t.Errorf("small default: moved = %d, want the full list", len(res.Moved))
+	}
+}
+
+func TestMarkCountsOnlyAboveThreshold(t *testing.T) {
+	ids := bulkIDs(bulkConfirmThreshold + 1)
+	s := testService(bulkFake())
+	res, err := s.Mark(context.Background(), MarkParams{IDs: ids, Action: "read", DryRun: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Changed) != 0 || len(res.AlreadySet) != 0 {
+		t.Errorf("changed/alreadySet enumerated, want counts only: %+v", res)
+	}
+	if res.ChangedCount != len(ids) || res.AlreadySetCount != 0 {
+		t.Errorf("counts = %d changed / %d alreadySet, want %d / 0", res.ChangedCount, res.AlreadySetCount, len(ids))
+	}
+	if res.ConfirmPhrase != "mark 21 emails read in account A1" {
+		t.Errorf("confirmPhrase = %q", res.ConfirmPhrase)
+	}
+}
+
+// Failures and vanished ids are the actionable exceptions — they are never
+// abridged, however large the run.
+func TestBulkCountsKeepFailuresInFull(t *testing.T) {
+	ids := bulkIDs(bulkConfirmThreshold + 1)
+	f := &fake{}
+	f.handler = func(calls []jmap.Invocation) *jmap.Response {
+		if calls[0].Name == "Mailbox/get" {
+			return response(result("Mailbox/get", calls[0].CallID, map[string]any{"list": mailboxFixture}))
+		}
+		return response(
+			result("Email/get", calls[0].CallID, map[string]any{
+				"list":     []any{map[string]any{"id": "e-0", "subject": "One", "mailboxIds": map[string]bool{"mb-inbox": true}}},
+				"notFound": []string{"e-1"},
+			}),
+			result("Email/set", calls[1].CallID, map[string]any{
+				"updated":    map[string]any{"e-0": nil},
+				"notUpdated": map[string]any{"e-2": map[string]any{"type": "forbidden", "description": "read-only mailbox"}},
+				"oldState":   "s1", "newState": "s2",
+			}),
+		)
+	}
+	s := testService(f)
+	res, err := s.Move(context.Background(), MoveParams{
+		IDs: ids, ToMailbox: "archive", Confirm: "move 21 emails to Archive in account A1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Moved) != 0 || res.MovedCount != 1 {
+		t.Errorf("moved = %v, movedCount = %d", res.Moved, res.MovedCount)
+	}
+	if res.Failed["e-2"] == "" || len(res.NotFound) != 1 || res.NotFound[0] != "e-1" {
+		t.Errorf("failed/notFound abridged: failed = %v, notFound = %v", res.Failed, res.NotFound)
 	}
 }
 

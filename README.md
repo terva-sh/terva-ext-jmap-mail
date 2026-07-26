@@ -73,12 +73,12 @@ phase.
 | `email_status` | network-read | config + account + capabilities + server limits + which tools config keeps off; no mail content |
 | `email_list_accounts` | network-read | accounts reachable with the credentials |
 | `email_list_mailboxes` | network-read | folders/labels with roles, display paths, and optional counts |
-| `email_search` | network-read | filtered search (structured params or a raw JMAP `filterJson`); bounded summaries + previews, never bodies; `hasMore` paging and opt-in exact totals |
+| `email_search` | network-read | filtered search (structured params or a raw JMAP `filterJson`); bounded summaries + previews, never bodies; `hasMore` paging and opt-in exact totals; `fields` projects the result (`["id"]` for bulk work, which lifts the page limit to 500) |
 | `email_get` | network-read | fetch ≤20 messages; bounded text/html bodies with truncation flags; URL tokens/queries redacted by default (`includeFullUrls` opts out) |
-| `email_get_thread` | network-read | whole thread by threadId or member email id; bodies redact like `email_get` |
-| `email_mark` | external-mutation | mark read/unread, flag/unflag (`$seen`/`$flagged`); dryRun |
-| `email_move` | external-mutation | move to a mailbox (or add with `keepInMailboxes`); dryRun + bulk confirm |
-| `email_trash` | external-mutation | move to Trash — **not** a permanent delete; dryRun + bulk confirm |
+| `email_get_thread` | network-read | thread by threadId or member email id, capped at the newest 100 messages (20 with bodies) and reporting what it omitted; bodies redact like `email_get` |
+| `email_mark` | external-mutation | mark read/unread, flag/unflag (`$seen`/`$flagged`); dryRun + bulk confirm; counts-only above 20 ids (`verbose`) |
+| `email_move` | external-mutation | move to a mailbox (or add with `keepInMailboxes`); dryRun + bulk confirm; counts + per-source-mailbox breakdown above 20 ids (`verbose`) |
+| `email_trash` | external-mutation | move to Trash — **not** a permanent delete; dryRun + bulk confirm; counts-only above 20 ids (`verbose`) |
 | `email_destroy` | external-mutation | **permanent, unrecoverable** delete; requires `access_level: read-organize-destroy`, in-Trash targets, and an exact confirm phrase |
 | `email_sieve_list` / `_get` / `_diff` | local-read | inspect the local sieve document store (versions, pending diffs, archived/context-only flags) |
 | `email_sieve_put` / `_restore` / `_mark_applied` / `_archive` | local-data | append versions (with lint + file import), lossless restore, record what's live, shelve mistakes without deleting |
@@ -112,6 +112,18 @@ candidate paths and ids.
   dry run returns it as `confirmPhrase`. Phrases bind the count, destination
   path, and account, so a phrase minted for one operation can never confirm
   a different one.
+
+  **What the confirm phrase is and is not.** It is a deliberation gate: it
+  makes a bulk mutation an act the model has to restate exactly, which is
+  what stops a careless or mistaken batch. It is **not** an authorization
+  boundary. The phrase is a deterministic function of the operation, and the
+  refusal prints it, so anything that can drive a tool call can produce one —
+  including a model acting on instructions injected through message content.
+  The boundaries are the ones the *user* controls: `access_level`, which
+  decides whether the mutating tools exist at all, and the host's own
+  permission gating on their `external-mutation` authority. Read the confirm
+  phrase as a guard against accidents, and the access level as the guard
+  against everything else.
 - **Trash is not destroy.** `email_trash` re-files messages into the
   `role=trash` mailbox per RFC 8621's delete-to-trash semantics and is always
   recoverable. Partial failures are reported per message id.
@@ -126,9 +138,27 @@ candidate paths and ids.
   and returns the phrase); and (4) bound to its own preview via JMAP
   `ifInState` — if the mailbox changes between the in-Trash check and the
   destroy, the server refuses and nothing is deleted.
-- **Bounded content.** Search returns summaries and previews only. Body
-  fetches are capped by `max_body_bytes` (tool calls may request less, never
-  more) and report truncation. Attachments are metadata-only.
+- **Message content is untrusted input.** Anyone who can email the user can
+  put text in a subject line, a preview, or a body that reaches the model
+  through the same channel as its instructions — and at `read-organize` the
+  model holds mark/move/trash. The injected context policy states plainly
+  that message content is data, never instructions, and that a message
+  asking for something is a fact to report rather than a request to carry
+  out. The extension is the component that knows this content is
+  attacker-supplied, so it says so on every install rather than relying on
+  the host's persona.
+- **Bounded content.** Every result has a ceiling that does not depend on how
+  much mail exists. Search returns summaries and previews only, and `fields`
+  narrows them further (an id-only projection skips the per-message fetch
+  entirely). Body fetches are capped by `max_body_bytes` (tool calls may
+  request less, never more) and report truncation. `email_get` takes at most
+  20 ids; `email_get_thread` returns the newest 100 messages of a thread (20
+  with bodies) and reports `count` and `omitted` so a trimmed thread is
+  visible rather than silent. Attachments are metadata-only. Organize results
+  above the bulk threshold report counts rather than enumerating every
+  message, so a 200-message batch costs kilobytes; `failed` and `notFound`
+  are never abridged. A hermetic test measures a whole 200-message
+  organization wave and fails if its tool output grows past a budget.
 - **URL redaction by default.** Fetched bodies routinely embed live
   credentials — unsubscribe tokens, one-click sign-ins, tracking ids — and
   fetched bodies land in agent context and transcripts. Query strings,
@@ -136,7 +166,10 @@ candidate paths and ids.
   URL (hosts and readable paths survive; `redactedUrls` counts the changes).
   `includeFullUrls: true` opts out for tasks that need a working link.
 - **No secret leakage.** The API token is never logged (config changes log
-  `has_api_token=true/false` only) and never appears in error text.
+  `has_api_token=true/false` only) and never appears in error text — 401/403
+  become a body-free `AuthError`, and any other error that quotes a provider
+  body scrubs the token (and any `Bearer …` echo) out of it first, before the
+  snippet is length-bounded.
 - **No caching of message content.** Only session/mailbox metadata is cached,
   in memory, with short TTLs.
 

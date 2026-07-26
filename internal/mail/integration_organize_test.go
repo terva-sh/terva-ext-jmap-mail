@@ -187,13 +187,17 @@ func TestIntegrationBulkConfirm(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), `"move 25 emails to Archive in account acc-test"`) {
 		t.Fatalf("err = %v", err)
 	}
-	// Re-running with that phrase succeeds and actually moves the mail.
+	// Re-running with that phrase succeeds and actually moves the mail. A run
+	// this size reports counts, not 25 subject lines.
 	res, err := svc.Move(ctx, mail.MoveParams{IDs: bulk, ToMailbox: "Archive", Confirm: "move 25 emails to Archive in account acc-test"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(res.Moved) != 25 {
-		t.Fatalf("moved = %d", len(res.Moved))
+	if res.MovedCount != 25 || len(res.Moved) != 0 {
+		t.Fatalf("movedCount = %d, moved = %d, want 25 and no enumeration", res.MovedCount, len(res.Moved))
+	}
+	if res.MovedFrom["Inbox"] != 25 {
+		t.Errorf("movedFrom = %v, want 25 from Inbox", res.MovedFrom)
 	}
 	archived, err := svc.Search(ctx, mail.SearchParams{Mailbox: "archive", From: "bulk@example.test", Limit: 100})
 	if err != nil {

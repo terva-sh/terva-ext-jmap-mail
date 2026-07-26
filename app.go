@@ -317,6 +317,7 @@ func (a *app) handleSearch(raw json.RawMessage) ext.ToolResult {
 		FilterJSON      json.RawMessage `json:"filterJson"`
 		CollapseThreads bool            `json:"collapseThreads"`
 		IncludeTotal    bool            `json:"includeTotal"`
+		Fields          []string        `json:"fields"`
 		Limit           int             `json:"limit"`
 		Position        int             `json:"position"`
 		Sort            string          `json:"sort"`
@@ -336,7 +337,7 @@ func (a *app) handleSearch(raw json.RawMessage) ext.ToolResult {
 		Subject: in.Subject, Body: in.Body, After: in.After, Before: in.Before,
 		HasAttachment: in.HasAttachment, Keyword: in.Keyword, NotKeyword: in.NotKeyword,
 		FilterJSON: in.FilterJSON, CollapseThreads: in.CollapseThreads, IncludeTotal: in.IncludeTotal,
-		Limit: in.Limit, Position: in.Position, Sort: in.Sort,
+		Fields: in.Fields, Limit: in.Limit, Position: in.Position, Sort: in.Sort,
 	})
 	if err != nil {
 		return ext.TextErrorResult(err.Error())
@@ -381,6 +382,7 @@ func (a *app) handleMark(raw json.RawMessage) ext.ToolResult {
 		Action    string   `json:"action"`
 		DryRun    bool     `json:"dryRun"`
 		Confirm   string   `json:"confirm"`
+		Verbose   *bool    `json:"verbose"`
 	}
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return ext.TextErrorResult("invalid args: " + err.Error())
@@ -393,6 +395,7 @@ func (a *app) handleMark(raw json.RawMessage) ext.ToolResult {
 	defer cancel()
 	result, err := svc.Mark(ctx, mail.MarkParams{
 		Account: in.AccountID, IDs: in.IDs, Action: in.Action, DryRun: in.DryRun, Confirm: in.Confirm,
+		Verbose: in.Verbose,
 	})
 	if err != nil {
 		return ext.TextErrorResult(err.Error())
@@ -411,6 +414,7 @@ func (a *app) handleMove(raw json.RawMessage) ext.ToolResult {
 		KeepInMailboxes bool     `json:"keepInMailboxes"`
 		DryRun          bool     `json:"dryRun"`
 		Confirm         string   `json:"confirm"`
+		Verbose         *bool    `json:"verbose"`
 	}
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return ext.TextErrorResult("invalid args: " + err.Error())
@@ -424,6 +428,7 @@ func (a *app) handleMove(raw json.RawMessage) ext.ToolResult {
 	result, err := svc.Move(ctx, mail.MoveParams{
 		Account: in.AccountID, IDs: in.IDs, ToMailbox: in.ToMailbox,
 		KeepInMailboxes: in.KeepInMailboxes, DryRun: in.DryRun, Confirm: in.Confirm,
+		Verbose: in.Verbose,
 	})
 	if err != nil {
 		return ext.TextErrorResult(err.Error())
@@ -440,6 +445,7 @@ func (a *app) handleTrash(raw json.RawMessage) ext.ToolResult {
 		IDs       []string `json:"ids"`
 		DryRun    bool     `json:"dryRun"`
 		Confirm   string   `json:"confirm"`
+		Verbose   *bool    `json:"verbose"`
 	}
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return ext.TextErrorResult("invalid args: " + err.Error())
@@ -452,6 +458,7 @@ func (a *app) handleTrash(raw json.RawMessage) ext.ToolResult {
 	defer cancel()
 	result, err := svc.Trash(ctx, mail.TrashParams{
 		Account: in.AccountID, IDs: in.IDs, DryRun: in.DryRun, Confirm: in.Confirm,
+		Verbose: in.Verbose,
 	})
 	if err != nil {
 		return ext.TextErrorResult(err.Error())
@@ -815,12 +822,14 @@ func (a *app) handleSieveArchive(raw json.RawMessage) ext.ToolResult {
 
 func (a *app) handleGetThread(raw json.RawMessage) ext.ToolResult {
 	var in struct {
-		AccountID       string `json:"accountId"`
-		ThreadID        string `json:"threadId"`
-		EmailID         string `json:"emailId"`
-		IncludeBodies   bool   `json:"includeBodies"`
-		MaxBodyBytes    int    `json:"maxBodyBytes"`
-		IncludeFullUrls bool   `json:"includeFullUrls"`
+		AccountID       string   `json:"accountId"`
+		ThreadID        string   `json:"threadId"`
+		EmailID         string   `json:"emailId"`
+		IncludeBodies   bool     `json:"includeBodies"`
+		Fields          []string `json:"fields"`
+		Limit           int      `json:"limit"`
+		MaxBodyBytes    int      `json:"maxBodyBytes"`
+		IncludeFullUrls bool     `json:"includeFullUrls"`
 	}
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return ext.TextErrorResult("invalid args: " + err.Error())
@@ -833,7 +842,8 @@ func (a *app) handleGetThread(raw json.RawMessage) ext.ToolResult {
 	defer cancel()
 	result, err := svc.GetThread(ctx, mail.ThreadParams{
 		Account: in.AccountID, ThreadID: in.ThreadID, EmailID: in.EmailID,
-		IncludeBodies: in.IncludeBodies, MaxBodyBytes: in.MaxBodyBytes, IncludeFullUrls: in.IncludeFullUrls,
+		IncludeBodies: in.IncludeBodies, Fields: in.Fields, Limit: in.Limit,
+		MaxBodyBytes: in.MaxBodyBytes, IncludeFullUrls: in.IncludeFullUrls,
 	})
 	if err != nil {
 		return ext.TextErrorResult(err.Error())

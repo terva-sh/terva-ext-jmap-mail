@@ -297,6 +297,107 @@ line; a body-budget cut inside a path token can drop it below the
 opaque-segment threshold; same-host-different-port JMAP servers share one
 sieve store; macOS case-insensitive filesystems fold doc-name case.
 
+## Field-report wave 2 (2026-07-25, v0.11.0)
+
+Three unrelated findings from an agent running the extension against a live
+Fastmail account: a bulk-organization payload report (3,000 messages archived
+in 200-message batches — ~321KB of tool output per batch, twelve operator
+prompts, four compactions) plus two review findings read at the v0.10.1 tag.
+
+- **Bulk payloads: ask for less.** `email_search` gained `fields`, a
+  projection over `EmailSummary`'s own property names that maps onto the
+  `Email/get` `properties` argument — so it saves provider bandwidth, not
+  just context. `fields:["id"]` is the case that matters and is special:
+  `Email/query` already returns exactly that, so the get is skipped
+  altogether (ids destroyed between query and get therefore reach the caller
+  and surface as `notFound` on the organize call — the right place for them).
+  A projection that omits `preview` raises the page cap from 100 to 500
+  (`maxProjectedSearchLimit`): the cap exists to bound payload, and preview
+  is nearly all of it. `mailboxes` is the one projected field with a cost
+  beyond the get — it drives the annotation lookup — so an id-only caller
+  never pays it.
+- **Paging correctness, a prerequisite for that cap.** `hasMore` came from a
+  limit+1 overfetch probe, which a server enforcing its own smaller limit
+  truncates away — at 500 that would read a provider-side cap as "no more
+  matches" and end a paging loop mid-backlog, silently. The Email/query
+  response's `limit` (RFC 8620 §5.5) is now honoured: where the server
+  capped, the applied page size comes back in the result and a full page
+  means "assume more". Over-reporting `hasMore` costs one empty page; the
+  other way round costs unnoticed messages.
+- **Organize results: counts above the bulk threshold.** `email_mark` /
+  `email_move` / `email_trash` results carry `changedCount` /
+  `alreadySetCount` / `movedCount` plus, for moves, a `movedFrom` breakdown
+  keyed by source mailbox display path. At or below `bulkConfirmThreshold`
+  the per-message lists stay (there the list IS the answer); above it they
+  are dropped unless `verbose:true`, and `verbose:false` suppresses them at
+  any size. `failed` and `notFound` are never abridged — they are the
+  actionable exceptions — and the dry run still returns `confirmPhrase`,
+  which was the only reason a bulk dry run was mandatory. Net effect on the
+  reported workload: ~321KB per 200-message batch → a few KB.
+  `email_destroy` deliberately keeps its full enumeration: small, always-
+  confirmed batches where the list is the point.
+- **`HTTPError` snippet can no longer reflect the bearer token.** A non-2xx
+  response that is neither 401/403 nor parseable problem JSON quoted up to
+  200 characters of the body into the error the tool caller sees; a provider,
+  proxy, or WAF that echoes the request's `Authorization` header would put
+  the token there. `snippet` now scrubs the token — and any `Bearer …` echo,
+  including of a credential we do not hold — **before** the length bound, so
+  a cut cannot leave a token fragment behind. `RequestError.Detail` gets the
+  same treatment. Residual: `MethodError.Description` is not scrubbed; it
+  comes from a well-formed JMAP method response, not the proxy-echo path.
+- **`email_get_thread` was the same defect, unfixed.** `email_get` caps at 20
+  ids because a result must be bounded; `GetThread` fetched every message of
+  a thread with no equivalent, and `includeBodies` gave each one the full
+  per-message budget — a long mailing-list thread was the largest payload
+  this extension could produce, reachable at `read-only` with no bulk
+  operation at all. Now capped at `maxThreadSummaries` (100) /
+  `maxThreadBodies` (= `maxGetIDs`, 20), caller-lowerable via `limit`, with
+  `count` (the thread's real size), `returned`, and `omitted` reported so a
+  trimmed thread is visible rather than silent. Messages are ordered by the
+  Thread's own `emailIds` (RFC 8621 §3: receivedAt order) instead of
+  Email/get's unspecified order, and the cap keeps the newest end. `fields`
+  projects the summary form; combined with `includeBodies` it is refused
+  rather than silently ignored, since bodies dominate that result anyway.
+  Residual: a result reference cannot be sliced, so the provider still sends
+  the whole thread — the cap bounds what reaches the caller, which is where
+  an unbounded thread does the damage.
+- **`queryState` is echoed on search results.** RFC 8620 §5.5's opaque query
+  state changes when the matching set changes, so a caller paging a backlog
+  while mutating it can tell that its cohort moved rather than discovering
+  the gap later, or never. Paired with a policy line naming the one real
+  rule: if the change removes messages from the filter, re-query at position
+  0 and never advance position; if it does not, advance position and don't
+  re-query; mixing them puts holes in a wave. (jmaptest's Email/query now
+  derives queryState from its mail state, which is what the spec requires and
+  what makes the drift detectable in tests.)
+- **A wave's payload is now a tested property.**
+  `TestIntegrationBulkWavePayloadBudget` runs the real 200-message
+  ids→dry-run→apply loop against the hermetic server, measures every tool
+  result, and fails if the total passes a per-message budget or exceeds a
+  single unprojected page. Measured: 4,176 bytes for 200 messages (~20
+  B/message) against the field report's ~321KB per 200-message batch. The
+  point is not the number but the ratchet — a property added to
+  `EmailSummary`, or an enumeration put back into an organize result, now
+  fails a test instead of quietly costing an operator a context window.
+- **`contextPolicy` states that message content is untrusted.** It covered
+  truncation, URL redaction, mailbox addressing, access levels, dryRun/confirm
+  and destroy safety, but never framed subjects, previews, bodies, and sender
+  names as data rather than instructions — and at `read-organize` the model
+  holds mark/move/trash, with runs of 20 or fewer needing no confirm phrase.
+  The extension is the only component that knows the content is
+  attacker-supplied; a host persona may or may not say so, and a default
+  install said nothing.
+- **The README now says what the confirm phrase is not.** Following directly
+  from the finding above: the phrase is a deterministic function of the
+  operation and the refusal prints it, so anything that can drive a tool call
+  can produce one — including a model acting on injected instructions. It is
+  a deliberation gate against careless batches, not an authorization
+  boundary; the boundaries are `access_level` and the host's gating on
+  `external-mutation` authority. Documented rather than hardened: minting a
+  per-dry-run nonce would close it, at the cost of the "refusal spells out
+  the phrase, recovery is one re-run" ergonomic the field report valued.
+  Open decision, deliberately not taken here.
+
 ## Safety invariants (all phases)
 
 - stdout is the wire; all logging via `Logf`/stderr.

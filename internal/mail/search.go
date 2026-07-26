@@ -30,6 +30,7 @@ type SearchParams struct {
 	FilterJSON      json.RawMessage // raw RFC 8621 §4.4 filter; exclusive with the fields above except Mailbox
 	CollapseThreads bool
 	IncludeTotal    bool
+	Fields          []string // projection: EmailSummary properties to return; empty = all
 	Limit           int
 	Position        int
 	Sort            string // "newest" (default) | "oldest"
@@ -40,20 +41,32 @@ type SearchResult struct {
 	AccountID string         `json:"accountId"`
 	Query     map[string]any `json:"query,omitempty"` // echo of the applied filter
 	Position  int            `json:"position"`
-	Limit     int            `json:"limit"`
+	Limit     int            `json:"limit"` // page size applied — below the request if the server capped it
 	Returned  int            `json:"returned"`
 	HasMore   bool           `json:"hasMore"` // more matches beyond position+returned
 	Total     *int           `json:"total,omitempty"`
-	Emails    []EmailSummary `json:"emails"`
+	// QueryState is the server's opaque state for this query (RFC 8620 §5.5).
+	// It changes when the matching set changes, so a caller paging through a
+	// backlog while mutating it can tell that its cohort moved underneath it
+	// rather than discovering the gap later, or never.
+	QueryState string         `json:"queryState,omitempty"`
+	Emails     []EmailSummary `json:"emails"`
 }
 
 const (
 	defaultSearchLimit = 20
 	maxSearchLimit     = 100
+	// maxProjectedSearchLimit applies when a projection drops preview — the
+	// cap exists to bound payload, and preview is nearly all of it. Bulk
+	// organization ("give me ids, move them") pages at maxSetIDs, so one
+	// projected page covers more than one mutating batch.
+	maxProjectedSearchLimit = 500
 )
 
 // Search runs Email/query + Email/get as one batched request, the query's ids
-// feeding the get via an RFC 8620 §3.7 result reference.
+// feeding the get via an RFC 8620 §3.7 result reference. A Fields projection
+// narrows the get's properties — and an id-only one drops the get entirely,
+// which is the shape bulk organization actually needs.
 func (s *Service) Search(ctx context.Context, p SearchParams) (*SearchResult, error) {
 	accountID, sess, err := s.account(ctx, p.Account)
 	if err != nil {
@@ -65,12 +78,21 @@ func (s *Service) Search(ctx context.Context, p SearchParams) (*SearchResult, er
 		return nil, err
 	}
 
+	fields, err := parseFields(p.Fields)
+	if err != nil {
+		return nil, err
+	}
+
 	limit := p.Limit
 	if limit <= 0 {
 		limit = defaultSearchLimit
 	}
-	if limit > maxSearchLimit {
-		limit = maxSearchLimit
+	maxLimit := maxSearchLimit
+	if fields.projected() && !fields.has("preview") {
+		maxLimit = maxProjectedSearchLimit
+	}
+	if limit > maxLimit {
+		limit = maxLimit
 	}
 	position := p.Position
 	if position < 0 {
@@ -103,14 +125,17 @@ func (s *Service) Search(ctx context.Context, p SearchParams) (*SearchResult, er
 		queryArgs["calculateTotal"] = true
 	}
 
-	resp, err := s.call(ctx, sess, []jmap.Invocation{
-		{Name: "Email/query", Args: queryArgs, CallID: "q0"},
-		{Name: "Email/get", Args: map[string]any{
+	// An id-only projection needs no Email/get at all: Email/query already
+	// returns exactly what was asked for.
+	calls := []jmap.Invocation{{Name: "Email/query", Args: queryArgs, CallID: "q0"}}
+	if !fields.idOnly() {
+		calls = append(calls, jmap.Invocation{Name: "Email/get", Args: map[string]any{
 			"accountId":  accountID,
 			"#ids":       jmap.ResultReference{ResultOf: "q0", Name: "Email/query", Path: "/ids"},
-			"properties": summaryProperties,
-		}, CallID: "g1"},
-	})
+			"properties": fields.properties(),
+		}, CallID: "g1"})
+	}
+	resp, err := s.call(ctx, sess, calls)
 	if err != nil {
 		return nil, err
 	}
@@ -120,57 +145,85 @@ func (s *Service) Search(ctx context.Context, p SearchParams) (*SearchResult, er
 		return nil, err
 	}
 	var q struct {
-		Position int      `json:"position"`
-		IDs      []string `json:"ids"`
-		Total    *int     `json:"total"`
+		Position   int      `json:"position"`
+		IDs        []string `json:"ids"`
+		Total      *int     `json:"total"`
+		QueryState string   `json:"queryState"`
+		// Limit is the server's own cap, reported only when it enforced one
+		// (RFC 8620 §5.5).
+		Limit *int `json:"limit"`
 	}
 	if err := json.Unmarshal(qres.Args, &q); err != nil {
 		return nil, fmt.Errorf("parse Email/query response: %v", err)
 	}
 
-	gres, err := resp.Result("g1")
-	if err != nil {
-		return nil, err
+	// The query asked for limit+1 as the hasMore probe. A server that enforces
+	// a smaller limit of its own truncates the probe away, so reading "fewer
+	// than limit+1 ids" as "no more matches" would silently end a paging loop
+	// mid-backlog. Where the server capped, fall back to "a full page means
+	// assume more" — over-reporting hasMore costs one empty page; the other
+	// way round costs unnoticed messages.
+	page := limit
+	hasMore := len(q.IDs) > limit
+	if q.Limit != nil && *q.Limit <= limit {
+		page = *q.Limit
+		hasMore = len(q.IDs) >= page
 	}
-	var g struct {
-		List []rawEmail `json:"list"`
-	}
-	if err := json.Unmarshal(gres.Args, &g); err != nil {
-		return nil, fmt.Errorf("parse Email/get response: %v", err)
+	ids := q.IDs
+	if len(ids) > page {
+		ids = ids[:page]
 	}
 
-	// Email/get MAY return objects in any order (RFC 8620 §5.1); present them
-	// in query order, dropping the hasMore-probe extra past the page limit.
-	byID := make(map[string]rawEmail, len(g.List))
-	for _, e := range g.List {
-		byID[e.ID] = e
-	}
-	hasMore := len(q.IDs) > limit
-	ids := q.IDs
-	if hasMore {
-		ids = ids[:limit]
-	}
-	emails := make([]EmailSummary, 0, len(ids))
-	for _, id := range ids {
-		e, ok := byID[id]
-		if !ok {
-			continue // destroyed between query and get
+	var emails []EmailSummary
+	if fields.idOnly() {
+		emails = make([]EmailSummary, 0, len(ids))
+		for _, id := range ids {
+			emails = append(emails, EmailSummary{ID: id})
 		}
-		emails = append(emails, e.summary(s.mailboxRefsByID(ctx, sess, accountID, e.MailboxIDs)))
+	} else {
+		gres, err := resp.Result("g1")
+		if err != nil {
+			return nil, err
+		}
+		var g struct {
+			List []rawEmail `json:"list"`
+		}
+		if err := json.Unmarshal(gres.Args, &g); err != nil {
+			return nil, fmt.Errorf("parse Email/get response: %v", err)
+		}
+		// Email/get MAY return objects in any order (RFC 8620 §5.1); present
+		// them in query order.
+		byID := make(map[string]rawEmail, len(g.List))
+		for _, e := range g.List {
+			byID[e.ID] = e
+		}
+		emails = make([]EmailSummary, 0, len(ids))
+		for _, id := range ids {
+			e, ok := byID[id]
+			if !ok {
+				continue // destroyed between query and get
+			}
+			var refs []MailboxRef
+			if fields.has("mailboxes") {
+				refs = s.mailboxRefsByID(ctx, sess, accountID, e.MailboxIDs)
+			}
+			emails = append(emails, e.summaryWith(refs, fields))
+		}
 	}
 	var total *int
 	if p.IncludeTotal && q.Total != nil {
 		total = q.Total
 	}
 	return &SearchResult{
-		AccountID: accountID,
-		Query:     filter,
-		Position:  q.Position,
-		Limit:     limit,
-		Returned:  len(emails),
-		HasMore:   hasMore,
-		Total:     total,
-		Emails:    emails,
+		AccountID:  accountID,
+		Query:      filter,
+		Position:   q.Position,
+		Limit:      page,
+		Returned:   len(emails),
+		HasMore:    hasMore,
+		Total:      total,
+		QueryState: q.QueryState,
+		Emails:     emails,
 	}, nil
 }
 

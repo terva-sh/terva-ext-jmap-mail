@@ -141,7 +141,10 @@ func (c *Client) setHeaders(req *http.Request) {
 
 // do executes the request and maps failures to the error taxonomy: AuthError
 // (401/403), RequestError (RFC 8620 §3.6.1 problem JSON), HTTPError
-// (anything else non-2xx). Error text never includes the Authorization header.
+// (anything else non-2xx). Error text never includes the Authorization header,
+// and every path that quotes provider-supplied text runs it through
+// redactSecrets first — an intermediary that echoes the header into a body
+// must not be able to reflect the token into the caller's transcript.
 func (c *Client) do(req *http.Request) ([]byte, error) {
 	res, err := c.HTTPClient.Do(req)
 	if err != nil {
@@ -165,9 +168,11 @@ func (c *Client) do(req *http.Request) ([]byte, error) {
 		if problem.Status == 0 {
 			problem.Status = res.StatusCode
 		}
+		// detail is free text the server chose; type and limit are enumerated.
+		problem.Detail = redactSecrets(problem.Detail, c.Token)
 		return nil, &problem
 	}
-	return nil, &HTTPError{StatusCode: res.StatusCode, Snippet: snippet(body)}
+	return nil, &HTTPError{StatusCode: res.StatusCode, Snippet: snippet(body, c.Token)}
 }
 
 // sanitizeErr strips any echo of the request URL's userinfo from transport
