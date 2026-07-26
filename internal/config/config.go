@@ -22,6 +22,23 @@ const (
 	// results share the model's context window and the wire has a 1 MiB
 	// tool-result budget.
 	maxMaxBodyBytes = 1_000_000
+
+	// DefaultAuditLog has auditing ON. This extension mutates a mailbox on the
+	// model's initiative, and the case for a default is the same one that
+	// justifies the feature: the deployment most in need of a record is the
+	// one that never thought to switch it on. It costs a few hundred bytes per
+	// tool call, writes only inside the extension's own data directory, and
+	// records no message content — so the default is cheap and the opt-out is
+	// one setting. TestAuditConfigIsDeclared pins this against the manifest.
+	DefaultAuditLog = true
+
+	// DefaultAuditRetainDays bounds the history a laptop accumulates. Rotated
+	// files are gzipped, so a month of heavy use is a few megabytes.
+	DefaultAuditRetainDays = 30
+
+	// DefaultAuditCompress gzips files once they stop being appended to. The
+	// file currently being written stays plain, so a collector can tail it.
+	DefaultAuditCompress = true
 )
 
 // Access levels form a monotonic ladder; tools above the configured level
@@ -45,6 +62,22 @@ type Settings struct {
 	// EnableSieveTools opts in to the local sieve document store tools
 	// (email_sieve_*); off by default — not everyone manages filters.
 	EnableSieveTools bool
+	// AuditLog keeps an append-only local record of every tool call
+	// (internal/audit). On by default — see DefaultAuditLog. No message
+	// content is ever written.
+	//
+	// A plain bool, not a pointer, because Settings must stay comparable with
+	// ==. That means the zero value is "off" and cannot be told apart from an
+	// explicit off, so the ON default is applied where the host config is read
+	// (app.currentSettings), which can see whether the key was present at all.
+	AuditLog bool
+	// AuditRetainDays bounds how long audit files are kept; 0 keeps them
+	// forever, which is a legitimate answer for a compliance deployment that
+	// ships records off-host and a bad one for a laptop.
+	AuditRetainDays int
+	// AuditCompress gzips rotated files. The current file stays plain so a
+	// collector can tail it.
+	AuditCompress bool
 }
 
 // AllowOrganize reports whether mark/move/trash are enabled.
@@ -70,6 +103,9 @@ func Normalize(s Settings) Settings {
 	}
 	if strings.TrimSpace(s.AccessLevel) == "" {
 		s.AccessLevel = AccessReadOnly
+	}
+	if s.AuditRetainDays < 0 {
+		s.AuditRetainDays = 0 // negative is not "delete everything"
 	}
 	return s
 }
@@ -110,8 +146,9 @@ func isLoopback(host string) bool {
 
 // Redacted renders the settings for logging: shape only, never the token.
 func (s Settings) Redacted() string {
-	return fmt.Sprintf("session_url=%s default_account=%q max_body_bytes=%d access_level=%s enable_sieve_tools=%v has_api_token=%v",
-		stripUserinfo(s.SessionURL), s.DefaultAccount, s.MaxBodyBytes, s.AccessLevel, s.EnableSieveTools, s.APIToken != "")
+	return fmt.Sprintf("session_url=%s default_account=%q max_body_bytes=%d access_level=%s enable_sieve_tools=%v audit_log=%v audit_retain_days=%d audit_compress=%v has_api_token=%v",
+		stripUserinfo(s.SessionURL), s.DefaultAccount, s.MaxBodyBytes, s.AccessLevel, s.EnableSieveTools,
+		s.AuditLog, s.AuditRetainDays, s.AuditCompress, s.APIToken != "")
 }
 
 // stripUserinfo drops any user:pass@ embedded in a URL before it reaches a

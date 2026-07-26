@@ -44,6 +44,24 @@ type Status struct {
 	EnableSieveTools bool     `json:"enableSieveTools"`
 	UnavailableTools []string `json:"unavailableTools,omitempty"`
 	ToolsHint        string   `json:"toolsHint,omitempty"`
+	// Audit reports whether this session's activity is being recorded, and
+	// where. An audit trail nobody can confirm is running is worth very
+	// little: the operator who switched it on needs to see that it took, and
+	// the model should know its actions are on the record. The glue layer
+	// fills this — internal/mail does not own the log.
+	Audit *AuditStatus `json:"audit,omitempty"`
+}
+
+// AuditStatus is the email_status view of the audit log.
+type AuditStatus struct {
+	Enabled bool `json:"enabled"`
+	// Path is the file currently being appended to; empty before the first
+	// record of the process, which is not an error.
+	Path       string `json:"path,omitempty"`
+	RetainDays int    `json:"retainDays,omitempty"`
+	// Note states the content policy plainly, because the one question an
+	// operator asks about a mail audit log is what it keeps.
+	Note string `json:"note,omitempty"`
 }
 
 // Accounts lists the accounts reachable with the configured credentials.

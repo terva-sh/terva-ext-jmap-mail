@@ -762,6 +762,111 @@ Checked and deliberately **not** changed, recorded so they are not re-filed:
 - **The sieve store's `DocKey.Name`** is the identifier: the user chose it,
   nothing else names the document, and there is no id it could be shadowing.
 
+## Audit logging (2026-07-26, v0.16.0)
+
+The extension reads and mutates a mailbox on the model's initiative. The
+transcript shows what the model *said* it did; only a log the model cannot
+write shows what happened. `internal/audit` writes one JSON Lines record per
+tool call to `<dataDir>/audit/audit-YYYY-MM-DD.NNN.jsonl`.
+
+**On by default** (`audit_log`), because the deployment most in need of a
+record is the one that never thought to switch it on. It costs a few hundred
+bytes per call, writes only inside the extension's own data directory, and
+records no message content, so the default is cheap and the opt-out is one
+setting.
+
+That default forced a subtlety. `Settings` must stay comparable with `==`, so
+`AuditLog` is a plain `bool` whose zero value is "off" — indistinguishable from
+an explicit off. And the SDK documents `Config` as possibly *empty* when the
+user set nothing, so relying on the host to overlay the manifest default would
+make auditing depend on whether anyone had ever opened `/extensions`. The
+settings that default ON are therefore read by **presence** (`Config.Raw`),
+not by value: only a key the user actually set can turn them off, and an
+explicit `audit_retain_days: 0` still means "keep everything" rather than
+falling back to 30. Verified by driving the shipped binary with no `audit_*`
+config at all — it audits.
+
+**The content policy is the design.** No subjects, senders, recipients,
+previews, or bodies, ever — and not the caller's search filter either, since a
+query over the mailbox is a standing description of what it contains. A record
+answers *which messages, by id, moved where, when, under which access level*.
+The one exception is `email_destroy`, which records per-message ids because the
+operation is unrecoverable and the ids are the only surviving evidence.
+
+That restraint is **structural, not careful**: `mail.AuditDetail` is an
+allow-list. A field added to a tool result later is invisible to the log until
+someone names it. A redaction pass would have the opposite default and would
+have shipped the sender names and subject lines `email_get` returned before
+v0.14.0 projected them away — the exact regression this design makes
+unavailable.
+
+- **Wrapped at registration**, not inside handlers: `a.audited(name, authority,
+  handler)` in `main()`. A tool added later is audited by construction.
+  `TestEveryToolIsAudited` reads main.go and fails if any `e.Tool` skips the
+  wrapper or audits under an authority that disagrees with its
+  `ext.WithAuthority`.
+- **Built from the raw JSON in both directions**, so the record describes what
+  actually crossed the boundary rather than a parallel reconstruction that
+  could drift from the result.
+- **Lifecycle records too.** `session_start` opens a session's stretch of the
+  trail with the permissions it begins under, and `config_change` records
+  `access_level` and `enable_sieve_tools` moving. Raising access_level to
+  read-organize-destroy is the most consequential thing that can happen here
+  and it leaves no tool call behind; a log without it would show the destroys
+  and not the permission that allowed them. The session_start record doubles
+  as the baseline the diff is taken against — without it the *first* change of
+  a process had nothing to compare to and went unrecorded. Found by driving the
+  real binary, not by reading the code.
+- **Failure is loud but never fatal.** An audit write that fails cannot fail
+  the mail operation: the record describes the work, it is not part of it. The
+  logger reports once to the host log, switches itself off, and says so through
+  `email_status`, which reports what is *actually* happening rather than what
+  was configured.
+- **`email_status` carries the audit block whatever else is broken** —
+  unconfigured, or with the provider returning 401. Verifying that activity is
+  being recorded must not depend on the connection working, and `email_status`
+  is what an operator reaches for precisely when something is wrong. A provider
+  failure now degrades to a `hint` on a normal status result, which is what
+  `Service.Status` already did for a failed account selection. Both gaps were
+  found by demoing the feature, not by reading it.
+- **`ts` is when the call started**, while records append on completion, so a
+  slow call can land after a faster one that began later. Sort by `ts`.
+- Files and the directory are `0600`/`0700`.
+
+### Rotation, retention, compression
+
+- **Date first, size second.** Normal use rolls at UTC midnight; the 8 MiB cap
+  is a backstop against a runaway loop, not a routine event. Records run
+  250–400 bytes, so 8 MiB is ~25,000 of them — the busiest measured wave (4,000
+  messages, 205 tool calls) produces well under 100 KB, so a size roll means
+  something is wrong.
+- **Filenames sort chronologically.** The sequence number is always present and
+  zero-padded, because `audit-2026-07-26.jsonl` would sort *after* its own
+  continuation `audit-2026-07-26.2.jsonl` (`.` precedes `j`). Reading an audit
+  log in written order should not require knowing that.
+- **Rotated files are gzipped** (`audit_compress`, on); the file being appended
+  to stays plain so a collector can tail it. Measured on 4,000 *varied* records
+  — identical ones compress absurdly well and prove nothing — **1,368,920 →
+  88,948 bytes, 6.5%**. A month of heavy use is single-digit megabytes.
+- The sweep runs on roll, so a process that never rolls never scans. Compression
+  goes via a temp file and a rename: the rename is the commit point, so an
+  interrupted run leaves the complete original rather than a truncated archive
+  standing in for it. A `.gz` also **holds its sequence slot** — without that, a
+  restart later the same day would write a second `.001.jsonl` beside the
+  `.001.jsonl.gz` it had already archived, and two files would claim the same
+  stretch of the record.
+- **Retention** deletes whole days past `audit_retain_days` (30; `0` keeps
+  everything), recognising both plain and `.gz`, and only files matching this
+  package's own naming — pinned by a test that seeds `notes.txt`,
+  `audit-nonsense.jsonl` and `audit-2026-13-99.jsonl` and requires all three to
+  survive.
+
+**Stated limit:** this is a local append-only file owned by the same process it
+describes. It is evidence of what the extension believes it did, not
+tamper-proof evidence — anything that can write the data dir can rewrite it. A
+deployment needing more should ship the records off-host, which is why the
+format is JSON Lines a collector can tail without parsing help.
+
 ## Safety invariants (all phases)
 
 - stdout is the wire; all logging via `Logf`/stderr.

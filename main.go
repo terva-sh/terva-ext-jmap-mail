@@ -30,28 +30,35 @@ func main() {
 
 	a := newApp(e)
 
+	// Every registration below is wrapped in a.audited, which writes one
+	// record per call when audit_log is on (internal/audit). Wrapping here
+	// rather than inside each handler means a tool added later is audited by
+	// construction — there is no per-handler line to forget, and the audit
+	// name and authority sit beside the ext.WithAuthority they must agree
+	// with. TestEveryToolIsAudited pins that none is missed.
+
 	// Read tools touch provider state over the network and mutate nothing —
 	// the honest declaration is network-read (not read_only, which claims a
 	// local, side-effect-free call).
 	netRead := ext.WithAuthority(ext.AuthorityNetworkRead)
-	e.Tool("email_status", descStatus, emptySchema(), a.handleStatus, netRead)
-	e.Tool("email_list_accounts", descAccounts, emptySchema(), a.handleListAccounts, netRead)
-	e.Tool("email_list_mailboxes", descMailboxes, schemaMailboxes(), a.handleListMailboxes, netRead)
-	e.Tool("email_search", descSearch, schemaSearch(), a.handleSearch, netRead)
-	e.Tool("email_get", descGet, schemaGet(), a.handleGet, netRead)
-	e.Tool("email_get_thread", descThread, schemaThread(), a.handleGetThread, netRead)
+	e.Tool("email_status", descStatus, emptySchema(), a.audited("email_status", authNetRead, a.handleStatus), netRead)
+	e.Tool("email_list_accounts", descAccounts, emptySchema(), a.audited("email_list_accounts", authNetRead, a.handleListAccounts), netRead)
+	e.Tool("email_list_mailboxes", descMailboxes, schemaMailboxes(), a.audited("email_list_mailboxes", authNetRead, a.handleListMailboxes), netRead)
+	e.Tool("email_search", descSearch, schemaSearch(), a.audited("email_search", authNetRead, a.handleSearch), netRead)
+	e.Tool("email_get", descGet, schemaGet(), a.audited("email_get", authNetRead, a.handleGet), netRead)
+	e.Tool("email_get_thread", descThread, schemaThread(), a.audited("email_get_thread", authNetRead, a.handleGetThread), netRead)
 
 	// Organization tools mutate provider state: external-mutation authority,
 	// and Sequential() so the SDK preserves the model's issue order instead of
 	// racing goroutines (e.g. mark-then-trash on the same messages).
 	extMutate := ext.WithAuthority(ext.AuthorityExternalMutate)
-	e.Tool("email_mark", descMark, schemaMark(), a.handleMark, extMutate, ext.Sequential())
-	e.Tool("email_move", descMove, schemaMove(), a.handleMove, extMutate, ext.Sequential())
-	e.Tool("email_trash", descTrash, schemaTrash(), a.handleTrash, extMutate, ext.Sequential())
+	e.Tool("email_mark", descMark, schemaMark(), a.audited("email_mark", authExtMutate, a.handleMark), extMutate, ext.Sequential())
+	e.Tool("email_move", descMove, schemaMove(), a.audited("email_move", authExtMutate, a.handleMove), extMutate, ext.Sequential())
+	e.Tool("email_trash", descTrash, schemaTrash(), a.audited("email_trash", authExtMutate, a.handleTrash), extMutate, ext.Sequential())
 
 	// Registered always, but withdrawn below access_level=read-organize-destroy
 	// (see app.syncVisibility) and refused by its handler regardless.
-	e.Tool("email_destroy", descDestroy, schemaDestroy(), a.handleDestroy, extMutate, ext.Sequential())
+	e.Tool("email_destroy", descDestroy, schemaDestroy(), a.audited("email_destroy", authExtMutate, a.handleDestroy), extMutate, ext.Sequential())
 
 	// Sieve document store: a local, append-only versioned home for the
 	// user's filter scripts (docs/sieve-workspace-design.md). These tools
@@ -60,13 +67,13 @@ func main() {
 	// stay honest. Sequential() on writes keeps model-issued order.
 	localRead := ext.WithAuthority(ext.AuthorityLocalRead)
 	localData := ext.WithAuthority(ext.AuthorityLocalData)
-	e.Tool("email_sieve_list", descSieveList, schemaSieveList(), a.handleSieveList, localRead)
-	e.Tool("email_sieve_get", descSieveGet, schemaSieveGet(), a.handleSieveGet, localRead)
-	e.Tool("email_sieve_diff", descSieveDiff, schemaSieveDiff(), a.handleSieveDiff, localRead)
-	e.Tool("email_sieve_put", descSievePut, schemaSievePut(), a.handleSievePut, localData, ext.Sequential())
-	e.Tool("email_sieve_restore", descSieveRestore, schemaSieveRestore(), a.handleSieveRestore, localData, ext.Sequential())
-	e.Tool("email_sieve_mark_applied", descSieveMarkApplied, schemaSieveMarkApplied(), a.handleSieveMarkApplied, localData, ext.Sequential())
-	e.Tool("email_sieve_archive", descSieveArchive, schemaSieveArchive(), a.handleSieveArchive, localData, ext.Sequential())
+	e.Tool("email_sieve_list", descSieveList, schemaSieveList(), a.audited("email_sieve_list", authLocalRead, a.handleSieveList), localRead)
+	e.Tool("email_sieve_get", descSieveGet, schemaSieveGet(), a.audited("email_sieve_get", authLocalRead, a.handleSieveGet), localRead)
+	e.Tool("email_sieve_diff", descSieveDiff, schemaSieveDiff(), a.audited("email_sieve_diff", authLocalRead, a.handleSieveDiff), localRead)
+	e.Tool("email_sieve_put", descSievePut, schemaSievePut(), a.audited("email_sieve_put", authLocalData, a.handleSievePut), localData, ext.Sequential())
+	e.Tool("email_sieve_restore", descSieveRestore, schemaSieveRestore(), a.audited("email_sieve_restore", authLocalData, a.handleSieveRestore), localData, ext.Sequential())
+	e.Tool("email_sieve_mark_applied", descSieveMarkApplied, schemaSieveMarkApplied(), a.audited("email_sieve_mark_applied", authLocalData, a.handleSieveMarkApplied), localData, ext.Sequential())
+	e.Tool("email_sieve_archive", descSieveArchive, schemaSieveArchive(), a.audited("email_sieve_archive", authLocalData, a.handleSieveArchive), localData, ext.Sequential())
 
 	// Config changes rebuild the service lazily (handlers re-read config per
 	// call); here we only log shape — never values — and re-sync visibility.
@@ -253,6 +260,17 @@ const (
 //
 // A genuinely required parameter (email_destroy's ids, email_get's ids) is the
 // exception to the first two: there is nothing for the inert value to mean.
+// The authority strings an audit record carries. They mirror the
+// ext.Authority* constants the same tool is registered with; a record that
+// claimed a weaker authority than the tool actually holds would be worse than
+// no record at all.
+const (
+	authNetRead   = "network-read"
+	authExtMutate = "external-mutation"
+	authLocalRead = "local-read"
+	authLocalData = "local-data"
+)
+
 func emptySchema() json.RawMessage {
 	return json.RawMessage(`{"type":"object","properties":{}}`)
 }

@@ -1,6 +1,6 @@
 {
   "name": "jmap-mail",
-  "version": "0.15.0",
+  "version": "0.16.0",
   "exec": "./run.sh",
   "language": "go",
   "description": "Read, search, and safely organize mail over JMAP providers such as Fastmail.",
@@ -39,6 +39,27 @@
       "type": "bool",
       "default": false,
       "description": "Offer the email_sieve_* tools: a local, versioned store for managing sieve mail filters (with the sieve-rules skill). Off by default; local-only either way."
+    },
+    {
+      "key": "audit_log",
+      "label": "Write an audit log",
+      "type": "bool",
+      "default": true,
+      "description": "Append a record of every email_* tool call — what was asked, what changed, when, and under which access level — to audit-YYYY-MM-DD.NNN.jsonl in the extension's data directory. Never records message subjects, senders, or bodies; only email_destroy records per-message ids, since that operation cannot be undone. On by default: this extension changes a mailbox on the model's initiative, and a few hundred bytes per call is a cheap record of what it did. email_status shows whether it is active and where it is writing."
+    },
+    {
+      "key": "audit_retain_days",
+      "label": "Audit log retention (days)",
+      "type": "int",
+      "default": 30,
+      "description": "Delete audit files older than this many days. 0 keeps them forever — right for a deployment that ships them off-host, wrong for a laptop. Ignored when audit_log is off."
+    },
+    {
+      "key": "audit_compress",
+      "label": "Compress rotated audit files",
+      "type": "bool",
+      "default": true,
+      "description": "gzip each audit file once it stops being written to; JSON Lines compresses to roughly a tenth. The current day's file stays uncompressed so a log collector can tail it. Turn off if whatever reads these files cannot handle .gz."
     },
     {
       "key": "access_level",

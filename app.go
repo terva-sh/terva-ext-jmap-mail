@@ -12,10 +12,12 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"terva-ext-jmap-mail/internal/audit"
 	"terva-ext-jmap-mail/internal/config"
 	"terva-ext-jmap-mail/internal/jmap"
 	"terva-ext-jmap-mail/internal/mail"
 	"terva-ext-jmap-mail/internal/sievestore"
+	"terva-ext-jmap-mail/internal/version"
 
 	"terva.sh/terva/packages/agent/ext"
 )
@@ -36,6 +38,19 @@ type app struct {
 	settings config.Settings
 	svc      *mail.Service
 	sieve    *sievestore.Store
+	// auditor records what every tool call did, when audit_log is on. Held
+	// here rather than passed down because internal/mail must stay SDK-free
+	// and know nothing about where its results end up.
+	auditor *audit.Logger
+	// auditFor is the settings snapshot the current auditor was built from, so
+	// a config change that switches auditing on or off, or moves the
+	// retention window, is picked up without rebuilding it on every call.
+	auditFor config.Settings
+	// lastConfig is what the audit trail has already seen, so a change can be
+	// reported as from→to. Separate from settings, which service() fills
+	// lazily and which would therefore miss the first change after a restart.
+	lastConfig   config.Settings
+	configSeeded bool
 	// sessionCWD is the active session's working directory (refreshed on
 	// every session_start / /cd). It is the jail root for sourcePath file
 	// imports — the host jails its own read tool to the workspace, and the
@@ -54,7 +69,43 @@ func (a *app) currentSettings() config.Settings {
 		MaxBodyBytes:     c.Int("max_body_bytes"),
 		AccessLevel:      c.String("access_level"),
 		EnableSieveTools: c.Bool("enable_sieve_tools"),
+		// The audit settings default ON, so they are read by PRESENCE rather
+		// than by value: Config.Bool cannot tell "the user turned it off" from
+		// "the host sent nothing", and those must not mean the same thing when
+		// the default is true. Raw reports whether the key was there at all.
+		AuditLog:        configBool(c, "audit_log", config.DefaultAuditLog),
+		AuditRetainDays: configInt(c, "audit_retain_days", config.DefaultAuditRetainDays),
+		AuditCompress:   configBool(c, "audit_compress", config.DefaultAuditCompress),
 	})
+}
+
+// configBool / configInt read a setting whose default is not the Go zero
+// value. The host overlays manifest defaults onto user values, but the SDK
+// documents Config as possibly empty when nothing was set — so a setting that
+// defaults ON must not depend on that overlay having happened. Presence
+// decides; only a key the user actually set can turn it off.
+func configBool(c ext.Config, key string, def bool) bool {
+	raw, ok := c.Raw(key)
+	if !ok || len(raw) == 0 {
+		return def
+	}
+	var v bool
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return def
+	}
+	return v
+}
+
+func configInt(c ext.Config, key string, def int) int {
+	raw, ok := c.Raw(key)
+	if !ok || len(raw) == 0 {
+		return def
+	}
+	var v int
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return def
+	}
+	return v
 }
 
 // service returns a mail.Service for the current config, rebuilding when the
@@ -137,6 +188,110 @@ func toolCtx() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), toolTimeout)
 }
 
+// --- audit ---
+
+// auditLogger returns the logger for the current configuration, rebuilding it
+// when the settings that shape it change. Returns nil when auditing is off,
+// which every call site treats as a no-op rather than a branch.
+func (a *app) auditLogger() *audit.Logger {
+	st := a.currentSettings()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.auditor != nil && a.auditFor == st {
+		return a.auditor
+	}
+	if a.auditor != nil {
+		a.auditor.Close()
+		a.auditor = nil
+	}
+	a.auditFor = st
+	if !st.AuditLog {
+		return nil
+	}
+	dataDir := a.e.Host().DataDir
+	if dataDir == "" {
+		// Fail loudly rather than silently not auditing: an operator who
+		// switched this on is entitled to know it did not take.
+		a.e.Logf("audit_log is on but the host provided no writable data directory — NOT auditing")
+		return nil
+	}
+	lg, err := audit.New(filepath.Join(dataDir, "audit"), 0, st.AuditRetainDays, st.AuditCompress, a.e.Logf)
+	if err != nil {
+		a.e.Logf("audit_log is on but could not be opened (%v) — NOT auditing", err)
+		return nil
+	}
+	a.auditor = lg
+	return lg
+}
+
+// audited wraps a tool handler so every call leaves a record: what was asked,
+// what happened, how long it took, and under which access level. Wrapping at
+// registration rather than inside each handler means a tool added later is
+// audited by construction — there is no per-handler line to forget.
+//
+// The record is built from the raw JSON in both directions, so it describes
+// exactly what crossed the boundary rather than a parallel reconstruction that
+// could drift from it. mail.AuditDetail decides what may be kept.
+func (a *app) audited(name, authority string, fn ext.ToolHandler) ext.ToolHandler {
+	return func(raw json.RawMessage) ext.ToolResult {
+		lg := a.auditLogger()
+		if lg == nil {
+			return fn(raw)
+		}
+		started := time.Now()
+		res := fn(raw)
+		// A tool result is one text block of JSON for every tool here; taking
+		// the first is enough, and a shape that is not JSON simply yields no
+		// detail rather than an error.
+		var body string
+		if len(res.Content) > 0 {
+			body = res.Content[0].Text
+		}
+		rec := audit.Record{
+			Time:      started.UTC().Format(time.RFC3339),
+			Tool:      name,
+			Authority: authority,
+			Access:    a.currentSettings().AccessLevel,
+			Outcome:   "ok",
+			Millis:    time.Since(started).Milliseconds(),
+		}
+		host := a.e.Host()
+		rec.Session, rec.Project = host.SessionID, host.ProjectID
+		if res.IsError {
+			rec.Outcome, rec.Error = "error", body
+			// An error body is the extension's own message, not a result:
+			// projecting it as one would find no fields and lose the reason.
+			rec.Detail, rec.Account = mail.AuditDetail(raw, nil)
+		} else {
+			rec.Detail, rec.Account = mail.AuditDetail(raw, json.RawMessage(body))
+		}
+		lg.Write(rec)
+		return res
+	}
+}
+
+// auditEvent records something that happened outside a tool call. Config
+// changes matter most: raising access_level from read-only to
+// read-organize-destroy is the single most consequential thing that can
+// happen to this extension, and it leaves no tool call behind.
+func (a *app) auditEvent(kind string, detail map[string]any) {
+	lg := a.auditLogger()
+	if lg == nil {
+		return
+	}
+	host := a.e.Host()
+	lg.Write(audit.Record{
+		Time:      time.Now().UTC().Format(time.RFC3339),
+		Session:   host.SessionID,
+		Project:   host.ProjectID,
+		Tool:      kind,
+		Authority: "lifecycle",
+		Access:    a.currentSettings().AccessLevel,
+		Outcome:   "ok",
+		Detail:    detail,
+	})
+}
+
 // jsonResult renders a tool result as indented JSON (small payloads; the
 // bounds live in internal/mail).
 func jsonResult(v any) ext.ToolResult {
@@ -155,7 +310,46 @@ func jsonResult(v any) ext.ToolResult {
 func (a *app) onConfig(_ ext.Config) {
 	st := a.currentSettings()
 	a.e.Logf("config updated: %s", st.Redacted())
+	a.auditConfigChange(st)
 	a.syncVisibility(nil)
+}
+
+// auditConfigChange records movement in the two settings that decide what the
+// model may do. Raising access_level from read-only to read-organize-destroy
+// is the most consequential thing that can happen to this extension and it
+// leaves no tool call behind, so a log without it would show the destroys and
+// not the permission that allowed them.
+//
+// Only these two fields, and only their values: never the token, never the
+// whole config map. Tracked against its own snapshot rather than the one
+// service() caches, which is built lazily and would make the first change
+// after a restart invisible.
+//
+// The baseline is normally laid down by the session_start record. A
+// config_update that somehow arrives before any session does is recorded as a
+// baseline of its own rather than as a diff against zero, which would report
+// a change from "" that never happened.
+func (a *app) auditConfigChange(st config.Settings) {
+	a.mu.Lock()
+	prev, seeded := a.lastConfig, a.configSeeded
+	a.lastConfig, a.configSeeded = st, true
+	a.mu.Unlock()
+	if !seeded {
+		a.auditEvent("config_baseline", map[string]any{
+			"accessLevel": st.AccessLevel, "sieveTools": st.EnableSieveTools,
+		})
+		return
+	}
+	if prev.AccessLevel != st.AccessLevel {
+		a.auditEvent("config_change", map[string]any{
+			"setting": "access_level", "from": prev.AccessLevel, "to": st.AccessLevel,
+		})
+	}
+	if prev.EnableSieveTools != st.EnableSieveTools {
+		a.auditEvent("config_change", map[string]any{
+			"setting": "enable_sieve_tools", "from": prev.EnableSieveTools, "to": st.EnableSieveTools,
+		})
+	}
 }
 
 // onSession is the cache-safe boundary: assert tool visibility for this
@@ -166,6 +360,20 @@ func (a *app) onSession(s ext.Session) {
 	a.mu.Lock()
 	a.sessionCWD = s.CWD
 	a.mu.Unlock()
+	// Open the session's stretch of the audit trail with the permissions it
+	// starts under. This is the baseline a later config_change is a diff
+	// against — without it the FIRST access_level change of a process has
+	// nothing to compare to and would go unrecorded, which is the one change
+	// most worth having. It also anchors the correlation: every record after
+	// this one carries the same session id.
+	st := a.currentSettings()
+	a.mu.Lock()
+	a.lastConfig, a.configSeeded = st, true
+	a.mu.Unlock()
+	a.auditEvent("session_start", map[string]any{
+		"accessLevel": st.AccessLevel, "sieveTools": st.EnableSieveTools,
+		"configured": st.Configured(), "version": version.Version,
+	})
 	a.syncVisibility(&s)
 }
 
@@ -243,7 +451,9 @@ func (a *app) requireSieve() error {
 func (a *app) handleStatus(_ json.RawMessage) ext.ToolResult {
 	st := a.currentSettings()
 	if !st.Configured() {
-		return jsonResult(mail.Status{Configured: false, Hint: notConfiguredMsg})
+		// The audit block rides along even here: confirming that activity is
+		// being recorded must not depend on the provider connection working.
+		return jsonResult(mail.Status{Configured: false, Hint: notConfiguredMsg, Audit: a.auditStatus(st)})
 	}
 	svc, err := a.service()
 	if err != nil {
@@ -253,13 +463,41 @@ func (a *app) handleStatus(_ json.RawMessage) ext.ToolResult {
 	defer cancel()
 	status, err := svc.Status(ctx)
 	if err != nil {
-		return ext.TextErrorResult(err.Error())
+		// A provider failure is status, not an absence of it. Service.Status
+		// already degrades this way for a failed account selection, and
+		// email_status is the tool an operator reaches for precisely when
+		// something is wrong — including to confirm that the audit trail is
+		// still recording. Returning a bare error would hide it exactly then.
+		return jsonResult(mail.Status{
+			Configured: true,
+			Hint:       err.Error(),
+			Audit:      a.auditStatus(st),
+		})
 	}
 	if gated := gatedTools(st); len(gated) > 0 {
 		status.UnavailableTools = gated
 		status.ToolsHint = "these tools are off by configuration (access_level / enable_sieve_tools); only the user can enable them, in /extensions (press c on jmap-mail)"
 	}
+	status.Audit = a.auditStatus(st)
 	return jsonResult(status)
+}
+
+// auditStatus describes the audit trail for email_status. It reports what is
+// actually happening rather than what was configured: a logger that failed to
+// open, or that switched itself off after a write error, reads as disabled
+// here even though audit_log is on — which is the whole point of showing it.
+func (a *app) auditStatus(st config.Settings) *mail.AuditStatus {
+	if !st.AuditLog {
+		return &mail.AuditStatus{Enabled: false}
+	}
+	lg := a.auditLogger()
+	return &mail.AuditStatus{
+		Enabled:    lg.Enabled(),
+		Path:       lg.Path(),
+		RetainDays: st.AuditRetainDays,
+		Note: "every email_* call is recorded: tool, account, counts, mailbox ids, outcome, and the access level in force. " +
+			"No subjects, senders, or bodies are ever written; per-message ids only for email_destroy, which cannot be undone.",
+	}
 }
 
 func (a *app) handleListAccounts(_ json.RawMessage) ext.ToolResult {

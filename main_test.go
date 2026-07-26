@@ -2,8 +2,15 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
+	"os"
+	"regexp"
 	"strings"
 	"testing"
+
+	"terva-ext-jmap-mail/internal/config"
+
+	"terva.sh/terva/packages/agent/ext"
 )
 
 // Every registered tool schema must be parseable JSON with a properties
@@ -274,6 +281,143 @@ func TestSearchSchemaOffersReturnIDs(t *testing.T) {
 		if !have[want] {
 			t.Errorf("returnIds cannot express %q", want)
 		}
+	}
+}
+
+// Auditing is wrapped at registration so a tool added later is audited by
+// construction. That only holds if nobody registers one bare, and the compiler
+// cannot say so — main() is a sequence of calls, not a table. This reads the
+// source instead: every e.Tool(...) must route its handler through a.audited,
+// and the audit authority string must match the ext.WithAuthority it is
+// registered with, or a record would claim a weaker permission than the tool
+// actually holds.
+func TestEveryToolIsAudited(t *testing.T) {
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Option identifier → the audit constant that must appear on the same
+	// line. Matched by name, since that is what the source says; the values
+	// behind them are checked against the SDK below.
+	authorityFor := map[string]string{
+		"netRead": "authNetRead", "extMutate": "authExtMutate",
+		"localRead": "authLocalRead", "localData": "authLocalData",
+	}
+	registration := regexp.MustCompile(`e\.Tool\("([a-z_]+)",[^\n]*\)`)
+	found := 0
+	for _, line := range strings.Split(string(src), "\n") {
+		m := registration.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		found++
+		tool := m[1]
+		if !strings.Contains(line, "a.audited(") {
+			t.Errorf("%s is registered without a.audited — it would leave no audit record", tool)
+			continue
+		}
+		if !strings.Contains(line, `a.audited("`+tool+`"`) {
+			t.Errorf("%s is audited under a different name: %s", tool, line)
+		}
+		for opt, want := range authorityFor {
+			if !strings.Contains(line, ", "+opt+")") && !strings.Contains(line, ", "+opt+",") {
+				continue
+			}
+			if !strings.Contains(line, want) {
+				t.Errorf("%s is registered %s but audited as something else — the record would misstate its authority", tool, opt)
+			}
+		}
+	}
+	if found < 17 {
+		t.Errorf("found only %d tool registrations; the scan is not seeing them all", found)
+	}
+
+	// The strings a record carries must be the SDK's own authority values. A
+	// log claiming "network-read" for a tool the host granted mutation rights
+	// to would misrepresent the permission the call ran under.
+	for _, pair := range []struct{ ours, sdk string }{
+		{authNetRead, ext.AuthorityNetworkRead},
+		{authExtMutate, ext.AuthorityExternalMutate},
+		{authLocalRead, ext.AuthorityLocalRead},
+		{authLocalData, ext.AuthorityLocalData},
+	} {
+		if pair.ours != pair.sdk {
+			t.Errorf("audit authority %q does not match the SDK's %q", pair.ours, pair.sdk)
+		}
+	}
+}
+
+// The audit config must be declared in the manifest, or the host never
+// surfaces it and the feature is unreachable.
+func TestAuditConfigIsDeclared(t *testing.T) {
+	raw, err := os.ReadFile("extension.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest struct {
+		Config []struct {
+			Key     string          `json:"key"`
+			Type    string          `json:"type"`
+			Default json.RawMessage `json:"default"`
+		} `json:"config"`
+	}
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	byKey := map[string]string{}
+	for _, f := range manifest.Config {
+		byKey[f.Key] = f.Type + ":" + string(f.Default)
+	}
+	// The manifest default and the code default must agree. They are applied
+	// in different places — the host overlays the manifest, and
+	// app.currentSettings applies the code constant when the host sent nothing
+	// — so a disagreement would make the effective default depend on whether
+	// the user had ever opened /extensions.
+	for _, tc := range []struct{ key, want string }{
+		{"audit_log", fmt.Sprintf("bool:%v", config.DefaultAuditLog)},
+		{"audit_compress", fmt.Sprintf("bool:%v", config.DefaultAuditCompress)},
+		{"audit_retain_days", fmt.Sprintf("int:%d", config.DefaultAuditRetainDays)},
+	} {
+		if got := byKey[tc.key]; got != tc.want {
+			t.Errorf("manifest %s = %q, but the code default is %q", tc.key, got, tc.want)
+		}
+	}
+	// Auditing is ON by default, and that is the whole point of the setting:
+	// the deployment most in need of a record is the one that never thought to
+	// switch it on.
+	if !config.DefaultAuditLog {
+		t.Error("audit_log no longer defaults on")
+	}
+}
+
+// The audit settings default ON, so they must be read by presence rather than
+// by value — a host that sends no config at all must still audit, while a user
+// who explicitly turned it off must be obeyed. Config.Bool cannot tell those
+// apart, which is exactly the bug this guards.
+func TestAuditDefaultsSurviveAnEmptyHostConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		cfg        ext.Config
+		wantLog    bool
+		wantRetain int
+	}{
+		{"host sent nothing", ext.Config{}, true, config.DefaultAuditRetainDays},
+		{"user turned it off", ext.Config{"audit_log": json.RawMessage(`false`)}, false, config.DefaultAuditRetainDays},
+		{"user turned it on", ext.Config{"audit_log": json.RawMessage(`true`)}, true, config.DefaultAuditRetainDays},
+		{"retention kept forever", ext.Config{"audit_retain_days": json.RawMessage(`0`)}, true, 0},
+		{"retention set", ext.Config{"audit_retain_days": json.RawMessage(`90`)}, true, 90},
+	} {
+		if got := configBool(tc.cfg, "audit_log", config.DefaultAuditLog); got != tc.wantLog {
+			t.Errorf("%s: audit_log = %v, want %v", tc.name, got, tc.wantLog)
+		}
+		if got := configInt(tc.cfg, "audit_retain_days", config.DefaultAuditRetainDays); got != tc.wantRetain {
+			t.Errorf("%s: audit_retain_days = %d, want %d", tc.name, got, tc.wantRetain)
+		}
+	}
+	// An explicit 0 must mean "keep forever", not "fall back to the default" —
+	// the distinction a value-based read would lose.
+	if got := configInt(ext.Config{"audit_retain_days": json.RawMessage(`0`)}, "audit_retain_days", 30); got != 0 {
+		t.Errorf("explicit 0 retention became %d; a compliance deployment cannot ask to keep everything", got)
 	}
 }
 
