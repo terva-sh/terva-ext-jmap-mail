@@ -49,8 +49,19 @@ type SearchResult struct {
 	// It changes when the matching set changes, so a caller paging through a
 	// backlog while mutating it can tell that its cohort moved underneath it
 	// rather than discovering the gap later, or never.
-	QueryState string         `json:"queryState,omitempty"`
-	Emails     []EmailSummary `json:"emails"`
+	QueryState string `json:"queryState,omitempty"`
+	// IDs carries an id-only projection flat, instead of as an array of
+	// single-key objects. Indented, `[{"id":"…"}]` costs about forty bytes per
+	// message against nineteen for the bare string — on the 200-id pages bulk
+	// organization pages at, that difference is the larger part of the result.
+	// Set only when the projection is exactly ["id"]; Emails is then omitted.
+	IDs    []string       `json:"ids,omitempty"`
+	Emails []EmailSummary `json:"emails,omitempty"`
+	// SelectionID names this result's ordered id set so a following
+	// email_move / email_mark / email_trash can operate on it without the
+	// caller retransmitting the ids. Minted only when the organization tools
+	// are available to use it. See handles.go.
+	SelectionID string `json:"selectionId,omitempty"`
 }
 
 const (
@@ -175,11 +186,9 @@ func (s *Service) Search(ctx context.Context, p SearchParams) (*SearchResult, er
 	}
 
 	var emails []EmailSummary
+	returned := len(ids)
 	if fields.idOnly() {
-		emails = make([]EmailSummary, 0, len(ids))
-		for _, id := range ids {
-			emails = append(emails, EmailSummary{ID: id})
-		}
+		// Nothing to shape: the ids go out flat, in IDs.
 	} else {
 		gres, err := resp.Result("g1")
 		if err != nil {
@@ -209,22 +218,43 @@ func (s *Service) Search(ctx context.Context, p SearchParams) (*SearchResult, er
 			}
 			emails = append(emails, e.summaryWith(refs, fields))
 		}
+		// A message destroyed between the query and the get is not in the
+		// result, so it must not be in the selection either.
+		surviving := make([]string, 0, len(emails))
+		for _, e := range emails {
+			surviving = append(surviving, e.ID)
+		}
+		ids, returned = surviving, len(emails)
 	}
 	var total *int
 	if p.IncludeTotal && q.Total != nil {
 		total = q.Total
 	}
-	return &SearchResult{
+	result := &SearchResult{
 		AccountID:  accountID,
 		Query:      filter,
 		Position:   q.Position,
 		Limit:      page,
-		Returned:   len(emails),
+		Returned:   returned,
 		HasMore:    hasMore,
 		Total:      total,
 		QueryState: q.QueryState,
 		Emails:     emails,
-	}, nil
+	}
+	if fields.idOnly() {
+		result.IDs = ids
+	}
+	// Mint a handle for the set so the next mutating call can name it. Only
+	// worth doing when that call is even possible: at read-only access level
+	// the organization tools are withdrawn, and an unusable token in every
+	// search result is noise.
+	if len(ids) > 0 && s.cfg.AllowOrganize() {
+		result.SelectionID = s.handles.putSelection(&selection{
+			AccountID: accountID,
+			IDs:       append([]string(nil), ids...),
+		})
+	}
+	return result, nil
 }
 
 // buildFilter maps params onto one RFC 8621 §4.4.1 FilterCondition (multiple

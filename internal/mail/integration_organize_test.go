@@ -182,14 +182,16 @@ func TestIntegrationBulkConfirm(t *testing.T) {
 	_, svc := startStackOn(t, srv)
 	ctx := context.Background()
 
-	// Refused without confirm; the refusal carries the exact phrase.
+	// Refused without confirm; the refusal carries the exact phrase, which
+	// names the destination, the account, and a digest of this exact batch.
 	_, err := svc.Move(ctx, mail.MoveParams{IDs: bulk, ToMailbox: "Archive"})
-	if err == nil || !strings.Contains(err.Error(), `"move 25 emails to Archive in account acc-test"`) {
+	if err == nil || !strings.Contains(err.Error(), `"move 25 emails to Archive in account acc-test [batch `) {
 		t.Fatalf("err = %v", err)
 	}
+	phrase := confirmPhraseFrom(t, err)
 	// Re-running with that phrase succeeds and actually moves the mail. A run
 	// this size reports counts, not 25 subject lines.
-	res, err := svc.Move(ctx, mail.MoveParams{IDs: bulk, ToMailbox: "Archive", Confirm: "move 25 emails to Archive in account acc-test"})
+	res, err := svc.Move(ctx, mail.MoveParams{IDs: bulk, ToMailbox: "Archive", Confirm: phrase})
 	if err != nil {
 		t.Fatal(err)
 	}

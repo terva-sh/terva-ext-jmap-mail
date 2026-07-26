@@ -6,6 +6,7 @@ package mail
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -234,7 +235,7 @@ func TestMoveCountsOnlyAboveThreshold(t *testing.T) {
 	if res.MovedFrom["Inbox"] != len(ids) || res.MovedFrom["Archive/Receipts"] != 5 {
 		t.Errorf("movedFrom = %v", res.MovedFrom)
 	}
-	if res.ConfirmPhrase != "move 21 emails to Archive in account A1" {
+	if want := movePhrase(len(ids), "Archive", "A1", ids); res.ConfirmPhrase != want {
 		t.Errorf("confirmPhrase = %q — the counts form must still hand back the phrase", res.ConfirmPhrase)
 	}
 	// The abridged form must not be mistakable for the full one.
@@ -289,8 +290,8 @@ func TestMarkCountsOnlyAboveThreshold(t *testing.T) {
 	if res.ChangedCount != len(ids) || res.AlreadySetCount != 0 {
 		t.Errorf("counts = %d changed / %d alreadySet, want %d / 0", res.ChangedCount, res.AlreadySetCount, len(ids))
 	}
-	if res.ConfirmPhrase != "mark 21 emails read in account A1" {
-		t.Errorf("confirmPhrase = %q", res.ConfirmPhrase)
+	if want := markPhrase(len(ids), "read", "A1", ids); res.ConfirmPhrase != want {
+		t.Errorf("confirmPhrase = %q, want %q", res.ConfirmPhrase, want)
 	}
 }
 
@@ -317,7 +318,7 @@ func TestBulkCountsKeepFailuresInFull(t *testing.T) {
 	}
 	s := testService(f)
 	res, err := s.Move(context.Background(), MoveParams{
-		IDs: ids, ToMailbox: "archive", Confirm: "move 21 emails to Archive in account A1",
+		IDs: ids, ToMailbox: "archive", Confirm: movePhrase(len(ids), "Archive", "A1", ids),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -339,7 +340,7 @@ func TestBulkConfirmGate(t *testing.T) {
 	s := testService(organizeFake())
 	// No confirm → refused, and the refusal names the exact phrase.
 	_, err := s.Move(context.Background(), MoveParams{IDs: ids, ToMailbox: "archive"})
-	if err == nil || !strings.Contains(err.Error(), `"move 21 emails to Archive in account A1"`) {
+	if err == nil || !strings.Contains(err.Error(), strconv.Quote(movePhrase(len(ids), "Archive", "A1", ids))) {
 		t.Fatalf("err = %v, want refusal with exact phrase", err)
 	}
 	// Wrong phrase → refused.
@@ -351,23 +352,23 @@ func TestBulkConfirmGate(t *testing.T) {
 		t.Errorf("dry run refused: %v", err)
 	}
 	// Exact phrase (case-insensitive) → allowed.
-	if _, err := s.Move(context.Background(), MoveParams{IDs: ids, ToMailbox: "archive", Confirm: "Move 21 Emails To Archive In Account A1"}); err != nil {
+	if _, err := s.Move(context.Background(), MoveParams{IDs: ids, ToMailbox: "archive", Confirm: strings.ToUpper(movePhrase(len(ids), "Archive", "A1", ids))}); err != nil {
 		t.Errorf("correct confirm refused: %v", err)
 	}
 	// A stale phrase for a different destination or account must not carry.
-	if _, err := s.Move(context.Background(), MoveParams{IDs: ids, ToMailbox: "archive", Confirm: "move 21 emails to Receipts in account A1"}); err == nil {
+	if _, err := s.Move(context.Background(), MoveParams{IDs: ids, ToMailbox: "archive", Confirm: movePhrase(len(ids), "Archive/Receipts", "A1", ids)}); err == nil {
 		t.Error("phrase minted for another destination accepted")
 	}
-	if _, err := s.Move(context.Background(), MoveParams{IDs: ids, ToMailbox: "archive", Confirm: "move 21 emails to Archive in account A2"}); err == nil {
+	if _, err := s.Move(context.Background(), MoveParams{IDs: ids, ToMailbox: "archive", Confirm: movePhrase(len(ids), "Archive", "A2", ids)}); err == nil {
 		t.Error("phrase minted for another account accepted")
 	}
 
 	// Trash uses its own phrase.
 	_, err = s.Trash(context.Background(), TrashParams{IDs: ids})
-	if err == nil || !strings.Contains(err.Error(), `"trash 21 emails in account A1"`) {
+	if err == nil || !strings.Contains(err.Error(), strconv.Quote(trashPhrase(len(ids), "A1", ids))) {
 		t.Fatalf("err = %v, want trash phrase", err)
 	}
-	if _, err := s.Trash(context.Background(), TrashParams{IDs: ids, Confirm: "trash 21 emails in account A1"}); err != nil {
+	if _, err := s.Trash(context.Background(), TrashParams{IDs: ids, Confirm: trashPhrase(len(ids), "A1", ids)}); err != nil {
 		t.Errorf("correct trash confirm refused: %v", err)
 	}
 }
@@ -427,7 +428,7 @@ func TestMarkBulkConfirmGate(t *testing.T) {
 	f := organizeFake()
 	s := testService(f)
 	_, err := s.Mark(context.Background(), MarkParams{IDs: ids, Action: "read"})
-	if err == nil || !strings.Contains(err.Error(), `"mark 21 emails read in account A1"`) {
+	if err == nil || !strings.Contains(err.Error(), strconv.Quote(markPhrase(len(ids), "read", "A1", ids))) {
 		t.Fatalf("err = %v, want refusal with exact phrase", err)
 	}
 	if len(f.recorded) != 0 {
@@ -437,8 +438,8 @@ func TestMarkBulkConfirmGate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.ConfirmPhrase != "mark 21 emails read in account A1" {
-		t.Errorf("dry-run confirmPhrase = %q", res.ConfirmPhrase)
+	if want := markPhrase(len(ids), "read", "A1", ids); res.ConfirmPhrase != want {
+		t.Errorf("dry-run confirmPhrase = %q, want %q", res.ConfirmPhrase, want)
 	}
 	if _, err := s.Mark(context.Background(), MarkParams{IDs: ids, Action: "read", Confirm: res.ConfirmPhrase}); err != nil {
 		t.Errorf("correct confirm refused: %v", err)

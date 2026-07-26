@@ -192,3 +192,124 @@ func TestResolveMailboxRefreshOnMiss(t *testing.T) {
 		t.Errorf("recorded %d Mailbox/get calls, want 2 (prime + refresh)", len(f.recorded))
 	}
 }
+
+// --- selector and projection (TW-024: four integers should not cost every
+// folder on the account) ---
+
+func TestListMailboxesSelector(t *testing.T) {
+	s := testService(mailboxFake())
+	ctx := context.Background()
+
+	// Mixed reference kinds, resolved the same way the rest of the extension
+	// resolves them: role, display name, id.
+	list, err := s.ListMailboxes(ctx, ListMailboxesParams{
+		IncludeCounts: true, Mailboxes: []string{"inbox", "Archive", "mb-trash"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Mailboxes) != 3 {
+		t.Fatalf("selector returned %d mailboxes: %+v", len(list.Mailboxes), list.Mailboxes)
+	}
+	// The list's own order survives narrowing.
+	for i, want := range []string{"mb-inbox", "mb-arch", "mb-trash"} {
+		if list.Mailboxes[i].ID != want {
+			t.Errorf("mailbox %d = %s, want %s", i, list.Mailboxes[i].ID, want)
+		}
+	}
+
+	// A reference matching nothing is an error: a reconciliation that silently
+	// gets fewer numbers than it asked for compares the wrong things.
+	if _, err := s.ListMailboxes(ctx, ListMailboxesParams{Mailboxes: []string{"inbox", "Nonesuch"}}); err == nil {
+		t.Error("unknown mailbox reference accepted")
+	}
+	// An ambiguous one likewise — "Receipts" names two folders here.
+	if _, err := s.ListMailboxes(ctx, ListMailboxesParams{Mailboxes: []string{"Receipts"}}); err == nil {
+		t.Error("ambiguous mailbox reference accepted")
+	}
+	// Naming the same mailbox twice is not an error and does not duplicate it.
+	dup, err := s.ListMailboxes(ctx, ListMailboxesParams{Mailboxes: []string{"inbox", "mb-inbox"}})
+	if err != nil || len(dup.Mailboxes) != 1 {
+		t.Errorf("duplicate reference = %+v, %v", dup, err)
+	}
+}
+
+func TestListMailboxesProjection(t *testing.T) {
+	f := mailboxFake()
+	s := testService(f)
+	ctx := context.Background()
+
+	list, err := s.ListMailboxes(ctx, ListMailboxesParams{
+		Mailboxes: []string{"inbox"}, Fields: []string{"name", "totalEmails", "unreadEmails"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Mailboxes) != 1 {
+		t.Fatalf("list = %+v", list.Mailboxes)
+	}
+	mb := list.Mailboxes[0]
+	if mb.ID != "mb-inbox" || mb.Name != "Inbox" || *mb.TotalEmails != 42 || *mb.UnreadEmails != 3 {
+		t.Errorf("projected mailbox = %+v", mb)
+	}
+	// Unrequested properties do not serialize at all.
+	payload := stringify(list)
+	for _, gone := range []string{"role", "path", "sortOrder", "totalThreads", "unreadThreads"} {
+		if strings.Contains(payload, `"`+gone+`"`) {
+			t.Errorf("projection leaked %s: %s", gone, payload)
+		}
+	}
+
+	// A projection naming no count field does not ask the server for counts,
+	// even though includeCounts defaults on at the tool layer.
+	f2 := mailboxFake()
+	s2 := testService(f2)
+	if _, err := s2.ListMailboxes(ctx, ListMailboxesParams{IncludeCounts: true, Fields: []string{"name", "role"}}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stringify(argsOf(t, f2.recorded[0][0])["properties"]), "unreadEmails") {
+		t.Errorf("counts fetched for a projection that does not want them")
+	}
+
+	if _, err := s.ListMailboxes(ctx, ListMailboxesParams{Fields: []string{"nonesuch"}}); err == nil {
+		t.Error("unknown field accepted")
+	}
+}
+
+// The narrowing has to be worth the parameter: four integers about two
+// mailboxes should not cost the whole folder tree.
+func TestListMailboxesProjectionIsCheap(t *testing.T) {
+	s := testService(mailboxFake())
+	ctx := context.Background()
+
+	full, err := s.ListMailboxes(ctx, ListMailboxesParams{IncludeCounts: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	narrow, err := s.ListMailboxes(ctx, ListMailboxesParams{
+		Mailboxes: []string{"inbox", "archive"}, Fields: []string{"name", "totalEmails", "unreadEmails"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fullBytes, narrowBytes := len(stringify(full)), len(stringify(narrow))
+	if narrowBytes*3 > fullBytes {
+		t.Errorf("narrowed listing %d bytes vs full %d — expected well under a third", narrowBytes, fullBytes)
+	}
+}
+
+// Callers passing neither must see exactly what they saw before.
+func TestListMailboxesDefaultsUnchanged(t *testing.T) {
+	s := testService(mailboxFake())
+	list, err := s.ListMailboxes(context.Background(), ListMailboxesParams{IncludeCounts: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Mailboxes) != len(mailboxFixture) {
+		t.Fatalf("default listing returned %d of %d mailboxes", len(list.Mailboxes), len(mailboxFixture))
+	}
+	inbox := list.Mailboxes[0]
+	if inbox.Name == "" || inbox.Path == "" || inbox.Role == "" || inbox.TotalEmails == nil {
+		t.Errorf("default listing lost properties: %+v", inbox)
+	}
+}

@@ -398,6 +398,142 @@ prompts, four compactions) plus two review findings read at the v0.10.1 tag.
   the phrase, recovery is one re-run" ergonomic the field report valued.
   Open decision, deliberately not taken here.
 
+## Distribution: prebuilt binaries (2026-07-25, v0.12.0)
+
+Until now `run.sh` only ever compiled, so installing the extension required a
+Go toolchain on the host, and the GitHub releases carried no assets at all
+(v0.10.1: zero). The launcher now prefers a **verified** prebuilt binary and
+keeps the source build as the fallback:
+
+- **`.github/workflows/release.yml`** (the repo's first CI) runs on every `v*`
+  tag push: re-checks the tag against `extension.json` and
+  `internal/version.Version` and fails the release on a mismatch, runs the
+  race tests, cross-builds darwin/linux × amd64/arm64 (`CGO_ENABLED=0`,
+  `-mod=vendor -trimpath` — pure Go, so one runner covers every target), and
+  uploads the four binaries plus `SHA256SUMS`. `workflow_dispatch` takes a tag
+  for backfills; `just release-assets vX.Y.Z` is the local fallback. The job is
+  gated on `github.server_url == 'https://github.com'`: the file ships, so it
+  also reaches the private Forgejo remote, which reads `.github/workflows/` and
+  has Actions enabled for this repo — without the gate, a runner registered
+  there later would run release jobs against the wrong host.
+- **`run.sh`** fetches `jmap-mail_<os>_<arch>` for the manifest's version and
+  installs it **only** on a SHA-256 match against the release's `SHA256SUMS`,
+  staging inside the install dir so the final move is an atomic rename — an
+  unverified or half-written file is never in a position to be exec'd. A
+  mismatch is reported loudly and discarded. Everything else — no asset, no
+  network, no curl/wget, or a source tree with local `.go`/`go.mod`/`vendor`
+  changes — falls through to `go build -mod=vendor`, so an offline host and a
+  developer mid-edit both keep working. `JMAP_MAIL_BUILD_FROM_SOURCE=1` opts
+  out entirely; `JMAP_MAIL_RELEASE_BASE` repoints the fetch at a fork or an
+  internal mirror.
+
+The trust posture is deliberately explicit: the extension now executes code it
+downloaded, so the checksum gate, the loud refusal, the source fallback, and
+the opt-out are the load-bearing parts — not the convenience. All five paths
+(verified install, tampered asset, missing asset, opt-out, local edits) were
+exercised against a `file://` release before this shipped.
+
+Consequence for the release flow: **a tag is not finished until its assets
+exist**, because until then every install silently falls back to compiling.
+`docs/release-process.md` steps 6 and 8 cover waiting for them and verifying
+the path a user actually takes.
+
+## Field-report wave 3 (2026-07-25, v0.13.0)
+
+The same fleet, re-measuring v0.11.0 against a live Fastmail account. The
+projection and counts-only work held: a 2,000-message archive wave ran in one
+context window on one instruction, no compactions, per-batch cost down ~17×.
+What was left was a shape problem. An archive batch is `email_search` →
+`email_move` dry run → `email_move` apply, and **all three carried the same 200
+ids** — 88% of the batch payload, 81% of the session's output tokens, and a
+34–39-second stall before each of the two calls the model had to *generate* the
+list into. Twelve of the wave's seventeen minutes were the model retyping ids
+it had just been handed.
+
+- **Selection handles and apply receipts** (`internal/mail/handles.go`). A
+  search result carries a `selectionId` naming its ordered id set; a dry run
+  returns a `receiptId` naming the previewed set plus the resolved operation.
+  `email_move` / `email_mark` / `email_trash` take `selection` or `receipt`
+  in place of `ids`, and a receipt replaces the confirm phrase as well — it
+  *is* the preview the phrase exists to force. State is in-memory,
+  per-process, TTL-bounded (15 min), capacity-bounded (64 each), and dies with
+  the service, which is to say with any config change. It never touches disk:
+  a handle that outlived the reasoning that produced it would be worse than no
+  handle. Losing one costs a re-search.
+- **This closes the open decision left at v0.11.0.** That entry noted the
+  confirm phrase binds count, destination and account but not *which
+  messages*, and that a per-dry-run nonce would close it at the cost of the
+  "refusal spells out the phrase, recovery is one re-run" ergonomic. Receipts
+  are that nonce, and the trade turned out to be avoidable: the phrase path is
+  untouched, so the recovery ergonomic survives for anyone passing ids, while
+  the receipt path is both cheaper *and* strictly bound. The phrase itself now
+  also carries `idBatchDigest` — the same order-independent fingerprint
+  `email_destroy` has used since it shipped — so even the ids path cannot
+  confirm a different batch of the same size to the same destination.
+- **Placement-drift detection instead of the proposed `queryState` refusal.**
+  The report asked for a selection whose `queryState` had advanced to be
+  refused. Two problems: JMAP methods in a batch run in order, so an
+  `Email/query` alongside the `Email/set` reports state *after* the mutation
+  (a guard would need its own round trip); and on a live mailbox `queryState`
+  advances whenever any mail arrives, so the guard would fire constantly for
+  reasons unrelated to the named ids. What the receipt does instead is
+  fingerprint each message's placement (or, for mark, the target keyword) as
+  the dry run saw it, and compare at apply time — the actual subjects, no
+  extra round trip, no false positives from unrelated churn. Drift is
+  **reported** (`drifted`, never abridged, with a note) rather than refused:
+  the caller named these exact ids, and vetoing 200 messages because one moved
+  would fail far more often than it would help.
+- **TW-025's `operationId` collapses into the receipt.** The report wanted
+  every mutating call to return an operation id that could be re-presented to
+  learn whether the work had landed. But its own failure case is "the tool
+  result was lost", and a server-generated id is lost with it — the caller
+  cannot present what it never saw. An idempotency key has to be something the
+  caller held *before* the apply, which is exactly the receipt. So a receipt
+  is consumed once: re-presenting an applied one returns the original result
+  with `replayed: true` and `appliedAt`, touching no network. A concurrent
+  second apply is refused while the first is in flight; a *failed* apply
+  releases the claim, because move and mark are idempotent at the provider and
+  retrying after an ambiguous error costs nothing.
+- **Flat id serialisation.** An id-only projection returned
+  `[{"id":"…"}, …]`; results are rendered with `MarshalIndent`, so that is ~40
+  bytes per message against ~20 for the bare string — measured at 8,113 bytes
+  for 200 ids, against the field report's 8,273 for the same page. It now
+  returns a flat `ids` array and omits `emails` entirely (an empty `emails`
+  beside a populated `ids` reads as "nothing found"). Every other projection
+  is byte-identical; the one visible change elsewhere is that a zero-result
+  search omits `"emails": []`, which `returned: 0` already said.
+- **`maxProjectedSearchLimit` (500) reconciled with `maxSetIDs` (200).** Not by
+  raising the mutating cap — that is one of the invariants the report itself
+  asked not to be traded — but by slicing: a mutating call takes `selection`
+  plus `selectionOffset`, consumes at most 200 from there, and reports
+  `selection.remaining`. One 500-id search now feeds three batches. Because
+  the ids were pinned at search time, the later slices are unaffected by what
+  the earlier ones moved — which is the entire reason the
+  re-query-from-position-0 discipline exists, so within one selection it stops
+  being necessary.
+- **`email_list_mailboxes` gained a selector and a projection** (TW-024).
+  Reconciling a wave needs four integers and was costing 12,644 bytes of every
+  folder on the account, twice per wave — 14.7% of the session's tool output.
+  `mailboxes:` narrows by the same id/role/path/name resolution used
+  everywhere else (a reference matching nothing is an error, never a silently
+  shorter list, or a reconciliation compares the wrong numbers); `fields:`
+  projects over `Mailbox`, and a projection naming no count field stops the
+  server from computing counts at all. Both default to v0.12.0 behaviour. The
+  fetch is still of the whole tree, because a display path is computed from the
+  parentId chain — the narrowing is about what crosses back to the caller,
+  which is where the cost was.
+- **`email_destroy` deliberately takes no handles.** Symmetry would argue for
+  it; the friction of naming ids outright is worth keeping on the one
+  unrecoverable operation, and its phrase has always been id-bound. A model
+  that tries `selection:` there gets a clean schema rejection.
+- **The wave budget test now measures arguments too.** Results were the only
+  thing `TestIntegrationBulkWavePayloadBudget` counted, which is precisely how
+  a regression whose cost is 88% arguments went unnoticed. It now runs the
+  same 200-message wave twice — once retyping ids, once naming a selection and
+  a receipt — and fails if the handle path is not comfortably cheaper.
+  Measured: 4,375 bytes against 10,082, with the short fake ids understating
+  the gap since a real provider's are twice as long.
+
 ## Safety invariants (all phases)
 
 - stdout is the wire; all logging via `Logf`/stderr.

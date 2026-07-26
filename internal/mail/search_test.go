@@ -2,6 +2,7 @@ package mail
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -181,13 +182,58 @@ func TestSearchIDOnlyProjectionSkipsGet(t *testing.T) {
 	if batch := findBatch(t, f, "Email/query"); len(batch) != 1 {
 		t.Fatalf("batch = %v, want Email/query alone", batch)
 	}
-	if len(res.Emails) != 1 || res.Emails[0].ID != "e1" {
-		t.Fatalf("emails = %+v", res.Emails)
+	// An id-only projection returns the ids flat, not wrapped one object per
+	// id: indented, `[{"id":"…"}]` costs roughly twice what the bare strings
+	// do, and on a 200-id page that difference is most of the result.
+	if len(res.IDs) != 1 || res.IDs[0] != "e1" {
+		t.Fatalf("ids = %+v", res.IDs)
 	}
-	// Nothing but the id may survive into the payload.
-	if got := stringify(res.Emails); got != `[{"id":"e1"}]` {
-		t.Errorf("emails = %s, want ids only", got)
+	if len(res.Emails) != 0 {
+		t.Errorf("emails = %+v, want the flat ids form instead", res.Emails)
 	}
+	if got := stringify(res.IDs); got != `["e1"]` {
+		t.Errorf("ids = %s, want a flat array", got)
+	}
+	// "emails" must not appear at all — an empty array beside a populated ids
+	// list reads as "nothing found".
+	if payload := stringify(res); strings.Contains(payload, `"emails"`) {
+		t.Errorf("payload still carries an emails key: %s", payload)
+	}
+	if res.Returned != 1 {
+		t.Errorf("returned = %d, want 1", res.Returned)
+	}
+}
+
+// The flat form is worth the change only if it is actually smaller, and the
+// size that matters is the one the tool emits: indented, nested inside the
+// result object. Pin the ratio so a field added to the projected path cannot
+// quietly undo it.
+func TestSearchIDOnlyProjectionIsSmallerThanObjects(t *testing.T) {
+	const page = 200
+	ids := make([]string, page)
+	objects := make([]EmailSummary, page)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("SuZdSx%06d", i) // 12 chars, as Fastmail's are
+		objects[i] = EmailSummary{ID: ids[i]}
+	}
+	render := func(r SearchResult) int {
+		b, err := json.MarshalIndent(r, "", "  ") // exactly what jsonResult does
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(b)
+	}
+	base := SearchResult{AccountID: "A1", Returned: page, Limit: page}
+	withIDs, withObjects := base, base
+	withIDs.IDs, withObjects.Emails = ids, objects
+
+	flat, wrapped := render(withIDs), render(withObjects)
+	if flat*10 > wrapped*6 {
+		t.Errorf("flat ids %d bytes vs wrapped %d (%.0f%%) — expected at most 60%%",
+			flat, wrapped, 100*float64(flat)/float64(wrapped))
+	}
+	t.Logf("200 ids: %d bytes flat vs %d wrapped (%d vs %d per id)",
+		flat, wrapped, flat/page, wrapped/page)
 }
 
 func TestSearchProjectionNarrowsGetProperties(t *testing.T) {

@@ -8,9 +8,11 @@ import? 'release.just'
 default:
     @just --list
 
-# Unit-test the pure logic (no SDK / no terva needed).
+# Unit-test everything: the pure logic in internal/ plus the root package's
+# tool registration (schemas and context policy). The SDK is vendored, so this
+# still needs no network and no terva install.
 test *ARGS:
-    go test -race ./internal/... {{ARGS}}
+    go test -race ./... {{ARGS}}
 
 # Live tests against a real JMAP provider (opt-in, read-only in phase 1).
 # Needs JMAP_TEST_SESSION_URL + JMAP_TEST_API_TOKEN in the environment.
@@ -57,7 +59,7 @@ try DIR=".": build
 
 # Pre-push gate: lint + race tests.
 ci: lint
-    go test -race ./internal/...
+    go test -race ./...
 
 # Tidy go.mod / go.sum, then re-vendor so the committed tree stays consistent.
 tidy:

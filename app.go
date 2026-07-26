@@ -278,8 +278,10 @@ func (a *app) handleListAccounts(_ json.RawMessage) ext.ToolResult {
 
 func (a *app) handleListMailboxes(raw json.RawMessage) ext.ToolResult {
 	var in struct {
-		AccountID     string `json:"accountId"`
-		IncludeCounts *bool  `json:"includeCounts"`
+		AccountID     string   `json:"accountId"`
+		IncludeCounts *bool    `json:"includeCounts"`
+		Mailboxes     []string `json:"mailboxes"`
+		Fields        []string `json:"fields"`
 	}
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return ext.TextErrorResult("invalid args: " + err.Error())
@@ -291,7 +293,10 @@ func (a *app) handleListMailboxes(raw json.RawMessage) ext.ToolResult {
 	includeCounts := in.IncludeCounts == nil || *in.IncludeCounts
 	ctx, cancel := toolCtx()
 	defer cancel()
-	list, err := svc.ListMailboxes(ctx, mail.ListMailboxesParams{Account: in.AccountID, IncludeCounts: includeCounts})
+	list, err := svc.ListMailboxes(ctx, mail.ListMailboxesParams{
+		Account: in.AccountID, IncludeCounts: includeCounts,
+		Mailboxes: in.Mailboxes, Fields: in.Fields,
+	})
 	if err != nil {
 		return ext.TextErrorResult(err.Error())
 	}
@@ -377,12 +382,15 @@ func (a *app) handleMark(raw json.RawMessage) ext.ToolResult {
 		return ext.TextErrorResult(err.Error())
 	}
 	var in struct {
-		AccountID string   `json:"accountId"`
-		IDs       []string `json:"ids"`
-		Action    string   `json:"action"`
-		DryRun    bool     `json:"dryRun"`
-		Confirm   string   `json:"confirm"`
-		Verbose   *bool    `json:"verbose"`
+		AccountID       string   `json:"accountId"`
+		IDs             []string `json:"ids"`
+		Selection       string   `json:"selection"`
+		SelectionOffset int      `json:"selectionOffset"`
+		Receipt         string   `json:"receipt"`
+		Action          string   `json:"action"`
+		DryRun          bool     `json:"dryRun"`
+		Confirm         string   `json:"confirm"`
+		Verbose         *bool    `json:"verbose"`
 	}
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return ext.TextErrorResult("invalid args: " + err.Error())
@@ -395,6 +403,7 @@ func (a *app) handleMark(raw json.RawMessage) ext.ToolResult {
 	defer cancel()
 	result, err := svc.Mark(ctx, mail.MarkParams{
 		Account: in.AccountID, IDs: in.IDs, Action: in.Action, DryRun: in.DryRun, Confirm: in.Confirm,
+		Selection: in.Selection, SelectionOffset: in.SelectionOffset, Receipt: in.Receipt,
 		Verbose: in.Verbose,
 	})
 	if err != nil {
@@ -410,6 +419,9 @@ func (a *app) handleMove(raw json.RawMessage) ext.ToolResult {
 	var in struct {
 		AccountID       string   `json:"accountId"`
 		IDs             []string `json:"ids"`
+		Selection       string   `json:"selection"`
+		SelectionOffset int      `json:"selectionOffset"`
+		Receipt         string   `json:"receipt"`
 		ToMailbox       string   `json:"toMailbox"`
 		KeepInMailboxes bool     `json:"keepInMailboxes"`
 		DryRun          bool     `json:"dryRun"`
@@ -427,6 +439,7 @@ func (a *app) handleMove(raw json.RawMessage) ext.ToolResult {
 	defer cancel()
 	result, err := svc.Move(ctx, mail.MoveParams{
 		Account: in.AccountID, IDs: in.IDs, ToMailbox: in.ToMailbox,
+		Selection: in.Selection, SelectionOffset: in.SelectionOffset, Receipt: in.Receipt,
 		KeepInMailboxes: in.KeepInMailboxes, DryRun: in.DryRun, Confirm: in.Confirm,
 		Verbose: in.Verbose,
 	})
@@ -441,11 +454,14 @@ func (a *app) handleTrash(raw json.RawMessage) ext.ToolResult {
 		return ext.TextErrorResult(err.Error())
 	}
 	var in struct {
-		AccountID string   `json:"accountId"`
-		IDs       []string `json:"ids"`
-		DryRun    bool     `json:"dryRun"`
-		Confirm   string   `json:"confirm"`
-		Verbose   *bool    `json:"verbose"`
+		AccountID       string   `json:"accountId"`
+		IDs             []string `json:"ids"`
+		Selection       string   `json:"selection"`
+		SelectionOffset int      `json:"selectionOffset"`
+		Receipt         string   `json:"receipt"`
+		DryRun          bool     `json:"dryRun"`
+		Confirm         string   `json:"confirm"`
+		Verbose         *bool    `json:"verbose"`
 	}
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return ext.TextErrorResult("invalid args: " + err.Error())
@@ -458,6 +474,7 @@ func (a *app) handleTrash(raw json.RawMessage) ext.ToolResult {
 	defer cancel()
 	result, err := svc.Trash(ctx, mail.TrashParams{
 		Account: in.AccountID, IDs: in.IDs, DryRun: in.DryRun, Confirm: in.Confirm,
+		Selection: in.Selection, SelectionOffset: in.SelectionOffset, Receipt: in.Receipt,
 		Verbose: in.Verbose,
 	})
 	if err != nil {

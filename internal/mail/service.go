@@ -36,6 +36,12 @@ type Service struct {
 	session   *jmap.Session
 	sessionAt time.Time
 	mailboxes map[string]mailboxCache // accountID → last fetched list
+
+	// handles holds selections and apply receipts (see handles.go). It is
+	// in-memory and dies with the service, which is the intent: a rebuild
+	// means the config changed, and a handle minted under other credentials
+	// must not survive into them.
+	handles *handleStore
 }
 
 type mailboxCache struct {
@@ -45,7 +51,12 @@ type mailboxCache struct {
 
 // NewService wires a service over a protocol client and validated settings.
 func NewService(client Caller, cfg config.Settings) *Service {
-	return &Service{client: client, cfg: cfg, mailboxes: map[string]mailboxCache{}}
+	return &Service{
+		client:    client,
+		cfg:       cfg,
+		mailboxes: map[string]mailboxCache{},
+		handles:   newHandleStore(),
+	}
 }
 
 // getSession returns the cached session resource, fetching when absent or

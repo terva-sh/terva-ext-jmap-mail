@@ -30,10 +30,14 @@ func startStack(t *testing.T, maxBodyBytes int) (jmaptest.Seed, *mail.Service) {
 // newStackService wires the real client+service onto a fake server.
 func newStackService(t *testing.T, srv *jmaptest.Server, maxBodyBytes int) *mail.Service {
 	t.Helper()
+	// read-organize, because the organize paths are what these tests drive —
+	// and because a search only mints a selectionId when the tools that could
+	// consume it are available.
 	cfg := config.Normalize(config.Settings{
 		SessionURL:   srv.SessionURL(),
 		APIToken:     srv.Token,
 		MaxBodyBytes: maxBodyBytes,
+		AccessLevel:  config.AccessOrganize,
 	})
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err) // httptest is http://127.0.0.1 — loopback http is allowed
@@ -49,15 +53,35 @@ func ids(emails []mail.EmailSummary) []string {
 	return out
 }
 
-// payloadSize measures a result the way the tool caller pays for it: as the
-// JSON that reaches the transcript.
-func payloadSize(t *testing.T, v any) int {
+// payloadOf renders a result the way the tool layer does — indented, which is
+// most of the reason a wrapped id costs about forty bytes and a bare one about
+// twenty — so a measured size here is comparable to a real transcript's.
+func payloadOf(t *testing.T, v any) string {
 	t.Helper()
-	b, err := json.Marshal(v)
+	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		t.Fatalf("marshal result: %v", err)
 	}
-	return len(b)
+	return string(b)
+}
+
+func payloadSize(t *testing.T, v any) int {
+	t.Helper()
+	return len(payloadOf(t, v))
+}
+
+// confirmPhraseFrom pulls the quoted phrase out of a bulk refusal, the way a
+// caller reading the message does. Phrases carry a digest of the id batch, so
+// a test cannot spell one out in advance without recomputing it.
+func confirmPhraseFrom(t *testing.T, err error) string {
+	t.Helper()
+	msg := err.Error()
+	i := strings.Index(msg, `"`)
+	j := strings.LastIndex(msg, `"`)
+	if i < 0 || j <= i {
+		t.Fatalf("no quoted phrase in refusal: %v", err)
+	}
+	return msg[i+1 : j]
 }
 
 func TestIntegrationStatus(t *testing.T) {
@@ -88,8 +112,8 @@ func TestIntegrationStatus(t *testing.T) {
 		t.Errorf("account capabilityUrns not surfaced: %+v", st.Accounts[0])
 	}
 	// Config gating is visible so agents know WHY tools are absent.
-	if st.AccessLevel != config.AccessReadOnly || st.EnableSieveTools {
-		t.Errorf("gating fields = %q/%v, want read-only/false", st.AccessLevel, st.EnableSieveTools)
+	if st.AccessLevel != config.AccessOrganize || st.EnableSieveTools {
+		t.Errorf("gating fields = %q/%v, want read-organize/false", st.AccessLevel, st.EnableSieveTools)
 	}
 }
 
@@ -264,16 +288,23 @@ func TestIntegrationSearch(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got, want := strings.Join(ids(projected.Emails), ","), strings.Join(ids(full.Emails), ","); got != want {
+		// The projected form carries its ids flat, in IDs, not as one object
+		// per id in Emails.
+		if got, want := strings.Join(projected.IDs, ","), strings.Join(ids(full.Emails), ","); got != want {
 			t.Fatalf("projected cohort = %s, want %s", got, want)
+		}
+		if len(projected.Emails) != 0 {
+			t.Errorf("projected result still carries %d email objects", len(projected.Emails))
 		}
 		fullBytes, projectedBytes := payloadSize(t, full), payloadSize(t, projected)
 		if projectedBytes >= fullBytes/4 {
 			t.Errorf("projected payload %d bytes vs full %d — expected a fraction of it", projectedBytes, fullBytes)
 		}
-		for _, e := range projected.Emails {
-			if e.Subject != "" || e.Preview != "" || len(e.From) != 0 || len(e.Mailboxes) != 0 {
-				t.Errorf("projection leaked properties: %+v", e)
+		// Nothing but ids may reach the caller — assert against the rendered
+		// payload, since there are no summary objects left to inspect.
+		for _, leaked := range []string{"subject", "preview", "from", "mailboxes", "receivedAt"} {
+			if strings.Contains(payloadOf(t, projected), `"`+leaked+`"`) {
+				t.Errorf("projection leaked %s: %s", leaked, payloadOf(t, projected))
 			}
 		}
 	})

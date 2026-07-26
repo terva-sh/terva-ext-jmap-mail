@@ -57,6 +57,15 @@ func testService(f *fake) *Service {
 	if f.session == nil && f.sessionErr == nil {
 		f.session = testSession()
 	}
+	return NewService(f, config.Normalize(config.Settings{APIToken: "tok", AccessLevel: config.AccessOrganize}))
+}
+
+// readOnlyService is testService at the default access level, for the paths
+// that behave differently when the organize tools are withdrawn.
+func readOnlyService(f *fake) *Service {
+	if f.session == nil && f.sessionErr == nil {
+		f.session = testSession()
+	}
 	return NewService(f, config.Normalize(config.Settings{APIToken: "tok"}))
 }
 

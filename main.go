@@ -96,16 +96,32 @@ const contextPolicy = "The email_* tools read and organize the user's mailboxes 
 	"truncation, and URLs in them are redacted by default (queries/tokens stripped) — includeFullUrls " +
 	"opts out when the user needs a working link. Search results report hasMore; pass includeTotal for " +
 	"an exact match count (e.g. when sizing a filter rule), and filterJson for raw JMAP AND/OR/NOT " +
-	"filters. For bulk work ask for less: email_search fields:[\"id\"] returns ids and paging metadata only " +
-	"(and raises the page limit to 500), and organize runs above 20 messages report counts instead of " +
-	"enumerating every message (verbose:true restores the list) — a 200-message batch then costs kilobytes, " +
-	"not hundreds. When organizing a backlog page by page, pick ONE discipline: if the change removes messages " +
+	"filters. For bulk work ask for less: email_search fields:[\"id\"] returns a flat ids array and paging " +
+	"metadata only (and raises the page limit to 500), and organize runs above 20 messages report counts " +
+	"instead of enumerating every message (verbose:true restores the list) — a 200-message batch then costs " +
+	"kilobytes, not hundreds. " +
+	// Retyping two hundred ids into a dry run and then into the apply was
+	// measured as most of a bulk session's output tokens and most of its
+	// wall-clock; handles exist so the model never has to, and the model only
+	// reaches for them if it is told to here.
+	"NEVER retype a list of ids you were just given. Every search result carries a selectionId; pass it as " +
+	"selection to email_move / email_mark / email_trash. Every dry run returns a receiptId; pass THAT to the " +
+	"real run, which then needs no ids and no confirm phrase. So a batch is: email_search fields:[\"id\"] → " +
+	"email_move selection:<selectionId> dryRun:true → email_move receipt:<receiptId>. A selection larger than " +
+	"200 is consumed 200 at a time via selectionOffset, and the result's selection.remaining says whether to " +
+	"come back — one 500-id search covers three batches. A receipt applies exactly the set its dry run " +
+	"previewed, so the preview and the change cannot disagree about which messages; if a call's result is lost, " +
+	"re-present the receipt rather than redoing the work, and it replays the original outcome instead of acting " +
+	"twice. When organizing a backlog page by page, pick ONE discipline: if the change removes messages " +
 	"from what the filter matches (moving mail out of the mailbox you searched), re-query at position 0 every " +
 	"time and never advance position, or you will skip messages; if it does not (flagging), advance position " +
-	"and do not re-query. queryState changes whenever the matching set changes — if it differs from the previous " +
+	"and do not re-query. Working through slices of ONE selection needs neither, because those ids were pinned " +
+	"when the search ran. queryState changes whenever the matching set changes — if it differs from the previous " +
 	"page, the cohort moved and the safe move is to restart at position 0. Mailboxes may be referenced " +
 	"by role (inbox, trash, sent, drafts, junk, archive), display path (Inbox/Gaming), display name, " +
-	"or id; email ids are stable across moves. If an expected tool is absent, email_status names the " +
+	"or id; email_list_mailboxes takes a mailboxes selector and a fields projection, so reconciling counts " +
+	"means asking for two folders and three numbers rather than every folder on the account. " +
+	"Email ids are stable across moves. If an expected tool is absent, email_status names the " +
 	"config gate that hides it (and if every email_* tool is missing, jmap-mail itself needs configuring " +
 	"in /extensions). The organization tools (email_mark, " +
 	"email_move, email_trash) support dryRun — preview before bulk changes; runs over 20 messages " +
@@ -125,13 +141,16 @@ const (
 
 	descAccounts = "List the JMAP accounts reachable with the configured credentials."
 
-	descMailboxes = "List mailboxes (folders/labels) with roles, display paths, and optional message counts."
+	descMailboxes = "List mailboxes (folders/labels) with roles, display paths, and optional message counts. " +
+		"mailboxes narrows the result to the folders you name (role, path, display name, or id) and fields projects it down to the " +
+		"properties you need — reconciling a bulk run costs a few hundred bytes that way instead of every folder on the account."
 
 	descSearch = "Search email; returns bounded summaries with previews, never full bodies. " +
 		"Filter by mailbox (role, path, name, or id), text, from/to/cc/bcc, subject, body, date range, attachments, keywords — " +
 		"or pass a raw JMAP filter via filterJson (supports AND/OR/NOT). " +
 		"hasMore reports whether matches remain past the page; includeTotal adds an exact match count. " +
-		"fields projects the result down to the properties you need — fields:[\"id\"] for bulk organization, which also raises the page limit to 500."
+		"fields projects the result down to the properties you need — fields:[\"id\"] for bulk organization, which also raises the page limit to 500. " +
+		"Results carry a selectionId naming the ids: pass it to email_move / email_mark / email_trash as selection instead of retyping them."
 
 	descGet = "Fetch up to 20 emails by id with bounded bodies (bodyFormat: text, html, both, or metadata for headers only). " +
 		"Results report body truncation. URL query strings and token-like segments in bodies are redacted by default " +
@@ -142,15 +161,24 @@ const (
 		"Bounded to the newest 100 messages (20 with bodies) — count is the thread's real size and omitted says how many " +
 		"older ones were left out; limit asks for fewer."
 
-	descMark = "Mark emails read/unread or flagged/unflagged. Supports dryRun; more than 20 ids requires confirm " +
+	// The three organize tools share a naming rule; state it identically in
+	// each description so a model reading only one of them still gets it.
+	descTargets = "Name the messages ONE of three ways: ids, selection (a selectionId from email_search), or " +
+		"receipt (a receiptId from this tool's own dry run). Prefer selection over retyping ids, and receipt over both — " +
+		"a receipt applies exactly the previewed set, needs no confirm phrase, and re-presenting one whose result you lost " +
+		"returns the original outcome instead of acting twice. "
+
+	descMark = "Mark emails read/unread or flagged/unflagged. " + descTargets +
+		"Supports dryRun; more than 20 ids requires confirm " +
 		"(the exact phrase from the refusal or the dry run's confirmPhrase). Runs above 20 report counts " +
 		"instead of every message unless verbose:true."
 
 	descMove = "Move emails to a mailbox (role, path, name, or id), removing them from other mailboxes " +
-		"unless keepInMailboxes is true. Supports dryRun; more than 20 ids requires confirm. Runs above 20 " +
+		"unless keepInMailboxes is true. " + descTargets +
+		"Supports dryRun; more than 20 ids requires confirm. Runs above 20 " +
 		"report movedCount plus a per-source-mailbox breakdown instead of every message unless verbose:true."
 
-	descTrash = "Move emails to the Trash mailbox — NOT a permanent delete; mail stays recoverable. " +
+	descTrash = "Move emails to the Trash mailbox — NOT a permanent delete; mail stays recoverable. " + descTargets +
 		"Supports dryRun; more than 20 ids requires confirm. Runs above 20 report counts instead of every " +
 		"message unless verbose:true."
 
@@ -188,7 +216,9 @@ func schemaMailboxes() json.RawMessage {
   "type": "object",
   "properties": {
     "accountId": {"type": "string", "description": "Account id or name; empty for the default account."},
-    "includeCounts": {"type": "boolean", "default": true, "description": "Include total/unread message counts."}
+    "includeCounts": {"type": "boolean", "default": true, "description": "Include total/unread message counts. Ignored when fields is set — the projection decides."},
+    "mailboxes": {"type": "array", "items": {"type": "string"}, "description": "Return only these mailboxes: role (inbox, archive, ...), path (Inbox/Gaming), display name, or id. Empty returns all of them. A reference matching nothing is an error, never a silently shorter list."},
+    "fields": {"type": "array", "items": {"type": "string", "enum": ["id", "name", "path", "parentId", "role", "sortOrder", "totalEmails", "unreadEmails", "totalThreads", "unreadThreads"]}, "description": "Return only these properties (id is always included); empty = all of them. Reconciling a wave usually wants [\"name\",\"totalEmails\",\"unreadEmails\"] over two named mailboxes rather than every folder on the account."}
   }
 }`)
 }
@@ -214,8 +244,8 @@ func schemaSearch() json.RawMessage {
     "filterJson": {"type": "object", "additionalProperties": true, "description": "Raw RFC 8621 Email/query filter (FilterCondition or AND/OR/NOT FilterOperator), e.g. from a Fastmail jmapquery block. Replaces the structured filter params; only mailbox may combine (ANDed in)."},
     "collapseThreads": {"type": "boolean", "default": false, "description": "At most one result per thread."},
     "includeTotal": {"type": "boolean", "default": false, "description": "Also return the exact total match count (may cost the server extra work)."},
-    "fields": {"type": "array", "items": {"type": "string", "enum": ["id", "threadId", "mailboxes", "keywords", "from", "to", "subject", "receivedAt", "sentAt", "hasAttachment", "size", "preview"]}, "description": "Return only these summary properties (id is always included); empty = all of them. Use [\"id\"] for bulk organization — it is by far the cheapest result shape and skips the per-message fetch entirely."},
-    "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 20, "description": "Page size. Above 100 requires a fields projection that omits preview; otherwise it is clamped to 100 (the applied value comes back as limit)."},
+    "fields": {"type": "array", "items": {"type": "string", "enum": ["id", "threadId", "mailboxes", "keywords", "from", "to", "subject", "receivedAt", "sentAt", "hasAttachment", "size", "preview"]}, "description": "Return only these summary properties (id is always included); empty = all of them. Use [\"id\"] for bulk organization — it skips the per-message fetch entirely and returns a flat ids array, by far the cheapest result shape."},
+    "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 20, "description": "Page size. Above 100 requires a fields projection that omits preview; otherwise it is clamped to 100 (the applied value comes back as limit). One 500-id page feeds three mutating calls via selectionId + selectionOffset."},
     "position": {"type": "integer", "minimum": 0, "default": 0, "description": "Offset for paging."},
     "sort": {"type": "string", "enum": ["newest", "oldest"], "default": "newest"}
   }
@@ -236,18 +266,27 @@ func schemaGet() json.RawMessage {
 }`)
 }
 
+// targetProperties are the three mutually exclusive ways every organize tool
+// lets a caller name its messages. Kept in one string so the three schemas
+// cannot drift, and so the "exactly one of these" rule is stated identically
+// wherever the model reads it.
+const targetProperties = `
+    "ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 200, "description": "Explicit message ids. Use selection instead when the ids came from an email_search you just ran — it is the same set without retyping it."},
+    "selection": {"type": "string", "description": "A selectionId from an email_search result: operates on that search's ids without resending them. Consumes at most 200 ids from selectionOffset; the result reports how many remain."},
+    "selectionOffset": {"type": "integer", "minimum": 0, "default": 0, "description": "Where in the selection to start. A 500-id search feeds three calls at offsets 0, 200, 400 — the ids were pinned at search time, so earlier batches moving mail does not shift the later ones."},
+    "receipt": {"type": "string", "description": "A receiptId from THIS tool's dry run: applies exactly the previewed set. Replaces both ids and confirm — the dry run already did the previewing the confirm phrase exists to force. Re-presenting a receipt whose result you lost returns the original outcome (replayed:true) instead of acting twice."},`
+
 func schemaMark() json.RawMessage {
 	return json.RawMessage(`{
   "type": "object",
   "properties": {
-    "accountId": {"type": "string", "description": "Account id or name; empty for the default account."},
-    "ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 200},
+    "accountId": {"type": "string", "description": "Account id or name; empty for the default account."},` + targetProperties + `
     "action": {"type": "string", "enum": ["read", "unread", "flag", "unflag"]},
-    "dryRun": {"type": "boolean", "default": false, "description": "Report what would change without changing it."},
-    "confirm": {"type": "string", "description": "Required above 20 ids: the exact phrase from the refusal message or the dry run's confirmPhrase, verbatim."},
+    "dryRun": {"type": "boolean", "default": false, "description": "Report what would change without changing it. Returns a receiptId — prefer applying that over resending ids."},
+    "confirm": {"type": "string", "description": "Required above 20 ids unless a receipt is presented: the exact phrase from the refusal message or the dry run's confirmPhrase, verbatim. The phrase is bound to the exact id set, so it cannot confirm a different batch."},
     "verbose": {"type": "boolean", "description": "List every affected message. Default: lists at or below 20 ids, counts only above it (failed/notFound are always listed in full). Set true to force the list, false to suppress it."}
   },
-  "required": ["ids", "action"]
+  "required": ["action"]
 }`)
 }
 
@@ -255,15 +294,13 @@ func schemaMove() json.RawMessage {
 	return json.RawMessage(`{
   "type": "object",
   "properties": {
-    "accountId": {"type": "string", "description": "Account id or name; empty for the default account."},
-    "ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 200},
-    "toMailbox": {"type": "string", "description": "Destination mailbox: role, path (Inbox/Gaming), display name, or id."},
+    "accountId": {"type": "string", "description": "Account id or name; empty for the default account."},` + targetProperties + `
+    "toMailbox": {"type": "string", "description": "Destination mailbox: role, path (Inbox/Gaming), display name, or id. Required except with a receipt, which already carries the destination its dry run resolved (pass it anyway and it must agree)."},
     "keepInMailboxes": {"type": "boolean", "default": false, "description": "Add the destination instead of replacing the current mailboxes (label-style)."},
-    "dryRun": {"type": "boolean", "default": false, "description": "Report what would move without moving it."},
-    "confirm": {"type": "string", "description": "Required above 20 ids: the exact phrase from the refusal message or the dry run's confirmPhrase, verbatim."},
+    "dryRun": {"type": "boolean", "default": false, "description": "Report what would move without moving it. Returns a receiptId — prefer applying that over resending ids."},
+    "confirm": {"type": "string", "description": "Required above 20 ids unless a receipt is presented: the exact phrase from the refusal message or the dry run's confirmPhrase, verbatim. The phrase is bound to the exact id set, so it cannot confirm a different batch."},
     "verbose": {"type": "boolean", "description": "List every moved message. Default: lists at or below 20 ids, counts only above it (movedCount plus a per-source-mailbox breakdown; failed/notFound always listed in full). Set true to force the list, false to suppress it."}
-  },
-  "required": ["ids", "toMailbox"]
+  }
 }`)
 }
 
@@ -271,13 +308,11 @@ func schemaTrash() json.RawMessage {
 	return json.RawMessage(`{
   "type": "object",
   "properties": {
-    "accountId": {"type": "string", "description": "Account id or name; empty for the default account."},
-    "ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 200},
-    "dryRun": {"type": "boolean", "default": false, "description": "Report what would be trashed without trashing it."},
-    "confirm": {"type": "string", "description": "Required above 20 ids: the exact phrase from the refusal message or the dry run's confirmPhrase, verbatim."},
+    "accountId": {"type": "string", "description": "Account id or name; empty for the default account."},` + targetProperties + `
+    "dryRun": {"type": "boolean", "default": false, "description": "Report what would be trashed without trashing it. Returns a receiptId — prefer applying that over resending ids."},
+    "confirm": {"type": "string", "description": "Required above 20 ids unless a receipt is presented: the exact phrase from the refusal message or the dry run's confirmPhrase, verbatim. The phrase is bound to the exact id set, so it cannot confirm a different batch."},
     "verbose": {"type": "boolean", "description": "List every trashed message. Default: lists at or below 20 ids, counts only above it (failed/notFound are always listed in full). Set true to force the list, false to suppress it."}
-  },
-  "required": ["ids"]
+  }
 }`)
 }
 

@@ -62,6 +62,33 @@ Any RFC 8620-compliant provider works: point `session_url` at its session
 resource. Generic autodiscovery (`/.well-known/jmap`, DNS SRV) is a later
 phase.
 
+### How the launcher gets a binary
+
+terva executes the manifest's `exec` verbatim — it never compiles Go — so
+`run.sh` makes sure a binary exists first. On first launch (and after any
+source change) it:
+
+1. downloads `jmap-mail_<os>_<arch>` for the manifest's version from that
+   tag's GitHub release, and installs it **only if** its SHA-256 matches the
+   release's `SHA256SUMS`, so no Go toolchain is needed;
+2. otherwise builds from source with `go build -mod=vendor` against the
+   committed `vendor/` tree — offline, no module download.
+
+Step 2 catches everything step 1 can't do: no published asset for your
+platform, no network, no `curl`/`wget`, or a checksum that doesn't match (in
+which case the download is discarded, loudly, and never executed). A source
+tree with local `.go` changes always builds, so your edits are never replaced
+by a release binary.
+
+| variable | effect |
+|---|---|
+| `JMAP_MAIL_BUILD_FROM_SOURCE=1` | skip the download entirely and always compile |
+| `JMAP_MAIL_RELEASE_BASE=<url>` | fetch assets from somewhere else (a fork, a mirror, an internal host) |
+
+Binaries are built by GitHub Actions from the tagged tree
+(`.github/workflows/release.yml`), for darwin and linux on amd64 and arm64.
+All launcher output goes to stderr — terva's stdout is the protocol wire.
+
 > **Credential note:** terva stores `secret` config values in plaintext in
 > `$TERVA_HOME/config.json` (masked in the UI, never logged by the host).
 > Treat that file as a credential store; do not commit it.
@@ -72,13 +99,13 @@ phase.
 |---|---|---|
 | `email_status` | network-read | config + account + capabilities + server limits + which tools config keeps off; no mail content |
 | `email_list_accounts` | network-read | accounts reachable with the credentials |
-| `email_list_mailboxes` | network-read | folders/labels with roles, display paths, and optional counts |
-| `email_search` | network-read | filtered search (structured params or a raw JMAP `filterJson`); bounded summaries + previews, never bodies; `hasMore` paging and opt-in exact totals; `fields` projects the result (`["id"]` for bulk work, which lifts the page limit to 500) |
+| `email_list_mailboxes` | network-read | folders/labels with roles, display paths, and optional counts; `mailboxes` narrows to named folders and `fields` projects the shape |
+| `email_search` | network-read | filtered search (structured params or a raw JMAP `filterJson`); bounded summaries + previews, never bodies; `hasMore` paging and opt-in exact totals; `fields` projects the result (`["id"]` returns a flat `ids` array and lifts the page limit to 500); results carry a `selectionId` naming the ids for the organize tools |
 | `email_get` | network-read | fetch ≤20 messages; bounded text/html bodies with truncation flags; URL tokens/queries redacted by default (`includeFullUrls` opts out) |
 | `email_get_thread` | network-read | thread by threadId or member email id, capped at the newest 100 messages (20 with bodies) and reporting what it omitted; bodies redact like `email_get` |
-| `email_mark` | external-mutation | mark read/unread, flag/unflag (`$seen`/`$flagged`); dryRun + bulk confirm; counts-only above 20 ids (`verbose`) |
-| `email_move` | external-mutation | move to a mailbox (or add with `keepInMailboxes`); dryRun + bulk confirm; counts + per-source-mailbox breakdown above 20 ids (`verbose`) |
-| `email_trash` | external-mutation | move to Trash — **not** a permanent delete; dryRun + bulk confirm; counts-only above 20 ids (`verbose`) |
+| `email_mark` | external-mutation | mark read/unread, flag/unflag (`$seen`/`$flagged`); ids, `selection`, or `receipt`; dryRun + bulk confirm; counts-only above 20 ids (`verbose`) |
+| `email_move` | external-mutation | move to a mailbox (or add with `keepInMailboxes`); ids, `selection`, or `receipt`; dryRun + bulk confirm; counts + per-source-mailbox breakdown above 20 ids (`verbose`) |
+| `email_trash` | external-mutation | move to Trash — **not** a permanent delete; ids, `selection`, or `receipt`; dryRun + bulk confirm; counts-only above 20 ids (`verbose`) |
 | `email_destroy` | external-mutation | **permanent, unrecoverable** delete; requires `access_level: read-organize-destroy`, in-Trash targets, and an exact confirm phrase |
 | `email_sieve_list` / `_get` / `_diff` | local-read | inspect the local sieve document store (versions, pending diffs, archived/context-only flags) |
 | `email_sieve_put` / `_restore` / `_mark_applied` / `_archive` | local-data | append versions (with lint + file import), lossless restore, record what's live, shelve mistakes without deleting |
@@ -108,10 +135,11 @@ candidate paths and ids.
   `dryRun:true` and reports what would change (with each message's current
   state). A non-dry run over **20 messages** — mark included — is refused
   unless `confirm` matches an exact generated phrase (e.g. `move 25 emails
-  to Inbox/Receipts in account u123`); the refusal spells it out and a bulk
-  dry run returns it as `confirmPhrase`. Phrases bind the count, destination
-  path, and account, so a phrase minted for one operation can never confirm
-  a different one.
+  to Inbox/Receipts in account u123 [batch 9c296e]`); the refusal spells it
+  out and a bulk dry run returns it as `confirmPhrase`. Phrases bind the
+  count, destination path, account, and a digest of the exact id set, so a
+  phrase minted for one operation can never confirm a different one — not
+  even a different batch of the same size to the same destination.
 
   **What the confirm phrase is and is not.** It is a deliberation gate: it
   makes a bulk mutation an act the model has to restate exactly, which is
@@ -124,6 +152,18 @@ candidate paths and ids.
   permission gating on their `external-mutation` authority. Read the confirm
   phrase as a guard against accidents, and the access level as the guard
   against everything else.
+- **The applied set is the previewed set.** A dry run returns a `receiptId`;
+  presenting it to the real run replaces both the ids and the confirm phrase,
+  and it carries the ids and the resolved destination the preview used — so
+  there is no argument by which an apply could act on different messages, or
+  land somewhere a rename moved. A receipt is consumed once: re-presenting an
+  applied one returns the original result with `replayed:true` instead of
+  acting twice, which is what makes retrying after a lost or ambiguous result
+  safe. Receipts (and the `selectionId` an `email_search` returns for naming
+  its ids) live in memory for 15 minutes, never touch disk, and do not survive
+  an extension restart — losing one costs a re-search, never correctness.
+  An apply also compares each message's placement against what the dry run
+  saw and reports any that moved in between, as `drifted`.
 - **Trash is not destroy.** `email_trash` re-files messages into the
   `role=trash` mailbox per RFC 8621's delete-to-trash semantics and is always
   recoverable. Partial failures are reported per message id.

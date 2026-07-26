@@ -64,14 +64,16 @@ Two independent tracks:
   sender→folder cases — they survive Fastmail's regeneration; custom sieve
   for anything the builder can't express.
 - **Backlog cleanup** (existing mail): `email_mark` / `email_move` /
-  `email_trash`, always `dryRun: true` first and show the preview. For more
-  than 20 messages the real run needs `confirm` — a bulk dry run includes
-  the phrase as `confirmPhrase` (and a refused real run spells it out); copy
-  it verbatim. The phrase is bound to the exact count, destination path, and
-  account, so re-preview whenever the plan changes. Batch by search result
-  pages (`hasMore` tells you when you're done; ids are stable across moves).
-  Never `email_destroy` for triage — Trash is recoverable, destroy is not
-  offered by this workflow.
+  `email_trash`, always `dryRun: true` first and show the preview. Apply the
+  dry run's `receiptId` rather than resending anything: a receipt names the
+  exact previewed set and replaces both the ids and the confirm phrase. If you
+  are passing ids instead, more than 20 needs `confirm` — a bulk dry run
+  includes the phrase as `confirmPhrase` (and a refused real run spells it
+  out); copy it verbatim. The phrase is bound to the exact count, destination
+  path, account, and id set, so re-preview whenever the plan changes. Batch by
+  search result pages (`hasMore` tells you when you're done; ids are stable
+  across moves). Never `email_destroy` for triage — Trash is recoverable,
+  destroy is not offered by this workflow.
 
 ### Working a large backlog
 
@@ -82,29 +84,58 @@ marking read over a filter that does not self-exclude does not, so for those
 keep the cohort narrow enough to finish in one pass.
 
 Collect ids with a projection, not full summaries:
-`email_search {mailbox: "inbox", before: "…", fields: ["id"], limit: 200}`
-returns ids and paging metadata and nothing else. Then hand that id list
-straight to `email_move` (200 per call is the cap). Above 20 ids the organize
-result reports `movedCount` and a per-source-mailbox breakdown instead of
-every subject line — the dry run's `confirmPhrase` and count are what you are
+`email_search {mailbox: "inbox", before: "…", fields: ["id"], limit: 500}`
+returns a flat `ids` array, paging metadata, and a `selectionId` — nothing
+else.
+
+**Never retype those ids.** The batch is three calls that each name the set
+once:
+
+```
+email_search  fields:["id"] limit:500   → ids + selectionId
+email_move    selection:<selectionId> dryRun:true
+                                        → counts + confirmPhrase + receiptId
+email_move    receipt:<receiptId>       → counts
+```
+
+A mutating call takes at most 200 ids, so a 500-id selection is worked in
+slices: pass `selectionOffset` 0, then 200, then 400, and read
+`selection.remaining` in each result to know when to stop. The ids were pinned
+when the search ran, so moving one slice does not shift the next.
+
+Above 20 ids the organize result reports `movedCount` and a per-source-mailbox
+breakdown instead of every subject line — the dry run's counts are what you are
 deciding on. Pass `verbose: true` only when the user wants to see the actual
 messages. Report progress as counts and the remaining total, re-measured with
-`includeTotal`, not as lists.
+`includeTotal`, not as lists. Reconcile with
+`email_list_mailboxes {mailboxes: ["inbox","archive"], fields: ["name","totalEmails","unreadEmails"]}`
+rather than pulling the whole folder tree.
 
-**Pick one paging discipline and hold it.** If the change removes messages
-from what the filter matches — moving mail out of the mailbox you searched —
-always re-query at `position: 0` and never advance `position`, or each batch
-shifts the cohort and you silently skip the messages that slid up. If it does
-not remove them (flagging, or marking read on a filter that doesn't test
-`$seen`), advance `position` and don't re-query. Mixing the two is how a wave
-develops holes nobody notices. `queryState` in the search result changes
-whenever the matching set changes: if it differs from the previous page while
-you are advancing `position`, the ground moved — restart at 0.
+If an apply reports `drifted`, those messages were somewhere other than where
+the dry run saw them — something else moved them in between. They were still
+acted on; say so and check them if placement mattered.
+
+**Pick one paging discipline and hold it.** Working slices of a single
+selection needs none of this — the ids are fixed. Across separate searches it
+still applies: if the change removes messages from what the filter matches —
+moving mail out of the mailbox you searched — always re-query at `position: 0`
+and never advance `position`, or each batch shifts the cohort and you silently
+skip the messages that slid up. If it does not remove them (flagging, or
+marking read on a filter that doesn't test `$seen`), advance `position` and
+don't re-query. Mixing the two is how a wave develops holes nobody notices.
+`queryState` in the search result changes whenever the matching set changes: if
+it differs from the previous page while you are advancing `position`, the
+ground moved — restart at 0.
 
 If the loop is interrupted (a compaction, a new instruction, an error mid-
-batch), do not reconstruct which ids you already applied from memory.
-Re-measure with `includeTotal` and resume from the current state; the counts
+batch), do not reconstruct which ids you already applied from memory. If you
+still hold the receipt for the call whose result you lost, present it again:
+an applied receipt replays the original outcome (`replayed: true`) instead of
+acting twice, which answers "did that batch land?" exactly. Otherwise
+re-measure with `includeTotal` and resume from the current state; the counts
 tell you where you are, and a re-applied move or mark is a no-op anyway.
+Selections and receipts live 15 minutes and do not survive an extension
+restart — losing one costs a re-search, never correctness.
 
 ## 5. Verify
 

@@ -1,0 +1,106 @@
+name: release
+
+# Tag-driven: pushing vX.Y.Z to the public repo builds the launcher binaries
+# and attaches them to that tag's release. run.sh prefers a verified prebuilt
+# binary over compiling, so these assets are what lets a user install the
+# extension without a Go toolchain — publish them before announcing a release.
+#
+# Everything here builds offline against the committed vendor/ tree, the same
+# way run.sh and a clean clone do.
+#
+# The job is gated on running against github.com — see the `if` below. The
+# private Forgejo remote carries this file too and would otherwise pick it up.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build assets for (e.g. v0.11.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  binaries:
+    # This file ships in the tree, so it also lands on the private Forgejo
+    # remote — whose Actions implementation reads .github/workflows/ too, and
+    # which has Actions enabled for this repo. The releases these assets belong
+    # to exist only on GitHub, and `gh` here talks to api.github.com, so
+    # anywhere else this job must be a no-op rather than a queued run or a
+    # confusing failure. Forgejo/Gitea set github.server_url to their own
+    # instance URL; a platform that sets nothing fails this test too, which is
+    # the safe direction.
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false # vendored: nothing to restore, nothing to download
+
+      - name: Resolve the tag and check the version triple
+        id: version
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          version="${tag#v}"
+          manifest="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' extension.json | head -1)"
+          code="$(sed -n 's/^var Version = "\([^"]*\)".*/\1/p' internal/version/version.go | head -1)"
+          echo "tag=$tag version=$version manifest=$manifest code=$code"
+          # The tag, extension.json, and internal/version must agree — a
+          # mismatch means the release names a version the binaries do not
+          # report, so fail here rather than publish it.
+          if [ "$version" != "$manifest" ] || [ "$version" != "$code" ]; then
+            echo "::error::version mismatch — tag $tag, extension.json $manifest, internal/version $code"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the tagged tree
+        run: |
+          set -euo pipefail
+          go build -mod=vendor ./...
+          go vet ./...
+          go test -race ./...
+
+      - name: Cross-build
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # Pure Go (no cgo anywhere in the tree), so every target
+          # cross-compiles from one runner. run.sh is bash, so the targets are
+          # the platforms that can run it.
+          for target in darwin/arm64 darwin/amd64 linux/amd64 linux/arm64; do
+            os="${target%/*}"; arch="${target#*/}"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
+              go build -mod=vendor -trimpath -o "dist/jmap-mail_${os}_${arch}" .
+          done
+          # Names here must match what run.sh asks for: jmap-mail_<os>_<arch>.
+          (cd dist && sha256sum jmap-mail_* > SHA256SUMS && cat SHA256SUMS)
+
+      - name: Publish the assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag='${{ steps.version.outputs.tag }}'
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            # Release notes on this project are hand-written; this only makes
+            # sure the assets have somewhere to live. Rewrite the body with
+            # `gh release edit` afterwards.
+            gh release create "$tag" dist/* \
+              --title "terva-ext-jmap-mail $tag" \
+              --generate-notes
+          fi
+          gh release view "$tag" --json assets \
+            --jq '.assets[] | "\(.name)\t\(.size) bytes"'
