@@ -629,8 +629,21 @@ type targetSet struct {
 // is the whole reason the re-query-from-position-0 discipline exists; within a
 // selection it stops being necessary.)
 func (s *Service) resolveTargets(accountID string, r targetRefs, kind receiptKind) (*targetSet, error) {
+	// Normalize before counting. A model that pads every declared property
+	// rather than omitting keys sends the inert value it can express — "" for
+	// the string selectors, and for ids an empty array or one holding nothing
+	// usable. None of those name a message, so none of them may count as
+	// naming one; a blank string is not a message id under any provider.
+	ids := make([]string, 0, len(r.IDs))
+	for _, id := range r.IDs {
+		if id = strings.TrimSpace(id); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	sel, rcptID := strings.TrimSpace(r.Selection), strings.TrimSpace(r.Receipt)
+
 	named := 0
-	for _, set := range []bool{len(r.IDs) > 0, r.Selection != "", r.Receipt != ""} {
+	for _, set := range []bool{len(ids) > 0, sel != "", rcptID != ""} {
 		if set {
 			named++
 		}
@@ -639,53 +652,71 @@ func (s *Service) resolveTargets(accountID string, r targetRefs, kind receiptKin
 	case named == 0:
 		return nil, fmt.Errorf("name the messages: ids, selection (from an email_search result's selectionId), or receipt (from this tool's own dry run)")
 	case named > 1:
-		return nil, fmt.Errorf("pass exactly one of ids, selection, or receipt — each names the whole set on its own")
+		// Spell out the corrected calls. The model that hits this is usually
+		// padding rather than confused about the contract, and it needs to be
+		// told which inert value to pad with — otherwise it varies the
+		// placeholder and retries forever.
+		return nil, fmt.Errorf("pass exactly one of ids, selection, or receipt — each names the whole set on its own. "+
+			"To use the handle, send ids as [] (or omit it): {\"selection\": %q} or {\"receipt\": %q}. "+
+			"To use the ids, send selection and receipt as \"\" (or omit them). "+
+			"An empty array, an empty string, and an absent key all mean \"not this one\"",
+			firstNonEmpty(sel, "sel_…"), firstNonEmpty(rcptID, "rcp_…"))
 	}
 
 	switch {
-	case r.Receipt != "":
+	case rcptID != "":
 		if r.DryRun {
 			return nil, fmt.Errorf("a receipt names an apply, not a preview — it was minted BY a dry run; pass selection or ids to preview again")
 		}
-		rcpt, err := s.handles.getReceipt(r.Receipt, kind)
+		rcpt, err := s.handles.getReceipt(rcptID, kind)
 		if err != nil {
 			return nil, err
 		}
 		if rcpt.AccountID != accountID {
-			return nil, fmt.Errorf("receipt %q was minted for account %s, not %s", r.Receipt, rcpt.AccountID, accountID)
+			return nil, fmt.Errorf("receipt %q was minted for account %s, not %s", rcptID, rcpt.AccountID, accountID)
 		}
 		return &targetSet{ids: rcpt.IDs, receipt: rcpt}, nil
 
-	case r.Selection != "":
-		sel, err := s.handles.getSelection(r.Selection)
+	case sel != "":
+		held, err := s.handles.getSelection(sel)
 		if err != nil {
 			return nil, err
 		}
-		if sel.AccountID != accountID {
-			return nil, fmt.Errorf("selection %q was minted for account %s, not %s — re-run email_search against the account you mean", r.Selection, sel.AccountID, accountID)
+		if held.AccountID != accountID {
+			return nil, fmt.Errorf("selection %q was minted for account %s, not %s — re-run email_search against the account you mean", sel, held.AccountID, accountID)
 		}
 		offset := r.SelectionOffset
 		if offset < 0 {
 			offset = 0
 		}
-		if offset >= len(sel.IDs) {
-			return nil, fmt.Errorf("selectionOffset %d is at or past the end of selection %q (%d ids) — the selection is fully consumed", offset, sel.ID, len(sel.IDs))
+		if offset >= len(held.IDs) {
+			return nil, fmt.Errorf("selectionOffset %d is at or past the end of selection %q (%d ids) — the selection is fully consumed", offset, held.ID, len(held.IDs))
 		}
-		ids := sel.IDs[offset:]
-		if len(ids) > maxSetIDs {
-			ids = ids[:maxSetIDs]
+		slice := held.IDs[offset:]
+		if len(slice) > maxSetIDs {
+			slice = slice[:maxSetIDs]
 		}
 		return &targetSet{
-			ids: ids,
+			ids: slice,
 			selection: &SelectionUse{
-				ID:        sel.ID,
+				ID:        held.ID,
 				Offset:    offset,
-				Count:     len(ids),
-				Remaining: len(sel.IDs) - offset - len(ids),
+				Count:     len(slice),
+				Remaining: len(held.IDs) - offset - len(slice),
 			},
 		}, nil
 	}
-	return &targetSet{ids: r.IDs}, nil
+	return &targetSet{ids: ids}, nil
+}
+
+// firstNonEmpty returns v when it is set, else the placeholder — so the
+// corrected-call examples in an error can quote the caller's own handle when it
+// gave one, and a shape hint when it did not.
+func firstNonEmpty(v, fallback string) string {
+	if v != "" {
+		return v
+	}
+	return fallback
 }
 
 // checkReceiptDestination refuses a toMailbox that names something other than

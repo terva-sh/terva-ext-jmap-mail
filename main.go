@@ -107,7 +107,10 @@ const contextPolicy = "The email_* tools read and organize the user's mailboxes 
 	"NEVER retype a list of ids you were just given. Every search result carries a selectionId; pass it as " +
 	"selection to email_move / email_mark / email_trash. Every dry run returns a receiptId; pass THAT to the " +
 	"real run, which then needs no ids and no confirm phrase. So a batch is: email_search fields:[\"id\"] → " +
-	"email_move selection:<selectionId> dryRun:true → email_move receipt:<receiptId>. A selection larger than " +
+	"email_move selection:<selectionId> dryRun:true → email_move receipt:<receiptId>. Those three ways of naming " +
+	"a set are alternatives: send exactly one, and if you fill in every field by habit, the inert value for the " +
+	"others is [] for ids and \"\" for selection and receipt — never a placeholder id, which reads as a real one. " +
+	"A selection larger than " +
 	"200 is consumed 200 at a time via selectionOffset, and the result's selection.remaining says whether to " +
 	"come back — one 500-id search covers three batches. A receipt applies exactly the set its dry run " +
 	"previewed, so the preview and the change cannot disagree about which messages; if a call's result is lost, " +
@@ -270,8 +273,17 @@ func schemaGet() json.RawMessage {
 // lets a caller name its messages. Kept in one string so the three schemas
 // cannot drift, and so the "exactly one of these" rule is stated identically
 // wherever the model reads it.
+//
+// Every one of them must have a representable "not this one" value, and the
+// schema must permit it. Models routinely pad every declared property rather
+// than omitting keys: "" is inert for selection and receipt, and 0 is inert for
+// selectionOffset, but `ids` shipped with minItems:1 in v0.13.0 — so the empty
+// array that means "not naming ids this way" was schema-invalid, and a padding
+// model substituted ["placeholder"], which is indistinguishable from a real
+// answer. Every selection-based call was then refused as naming two selectors.
+// Hence no minItems here. maxItems stays: it is a real bound, not a floor.
 const targetProperties = `
-    "ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 200, "description": "Explicit message ids. Use selection instead when the ids came from an email_search you just ran — it is the same set without retyping it."},
+    "ids": {"type": "array", "items": {"type": "string"}, "maxItems": 200, "description": "Explicit message ids. Use selection instead when the ids came from an email_search you just ran — it is the same set without retyping it. An empty array [] means \"not naming ids this way\" and is exactly equivalent to omitting the key — pad it with [] when you are using selection or receipt."},
     "selection": {"type": "string", "description": "A selectionId from an email_search result: operates on that search's ids without resending them. Consumes at most 200 ids from selectionOffset; the result reports how many remain."},
     "selectionOffset": {"type": "integer", "minimum": 0, "default": 0, "description": "Where in the selection to start. A 500-id search feeds three calls at offsets 0, 200, 400 — the ids were pinned at search time, so earlier batches moving mail does not shift the later ones."},
     "receipt": {"type": "string", "description": "A receiptId from THIS tool's dry run: applies exactly the previewed set. Replaces both ids and confirm — the dry run already did the previewing the confirm phrase exists to force. Re-presenting a receipt whose result you lost returns the original outcome (replayed:true) instead of acting twice."},`

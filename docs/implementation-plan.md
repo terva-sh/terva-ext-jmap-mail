@@ -534,6 +534,48 @@ it had just been handed.
   Measured: 4,375 bytes against 10,082, with the short fake ids understating
   the gap since a real provider's are twice as long.
 
+## Field-report wave 4 (2026-07-26, v0.13.1)
+
+v0.13.0's handles were unusable by the model the fleet actually runs, and the
+whole defect was one schema keyword. `targetProperties` declared `ids` with
+`minItems: 1`, so `[]` — the value meaning "not naming ids this way" — was
+schema-invalid. A model that pads every declared property rather than omitting
+keys therefore had to put *something* in it, and everything it put there
+(`["placeholder"]`, `["dummy"]`, `["x"]`, `[""]`) read as a real selector. Every
+selection-based call was refused as naming two selectors at once. Wave 3 was
+authorised and archived nothing: twenty `email_move` calls, nineteen rejected.
+
+The validation was right, the error message was accurate, nothing upstream was
+rewriting the schema. Absence was simply inexpressible for one of three mutually
+exclusive parameters — and it was the one whose padded form is indistinguishable
+from a real answer. `""` had made `selection` and `receipt` inert by accident of
+being strings; `ids` got no such luck.
+
+- **`minItems: 1` dropped from `ids`** in `targetProperties` (`maxItems: 200`
+  stays — a real bound, not a floor), and the description now says outright that
+  `[]` and an absent key are equivalent. `email_destroy` keeps both `minItems`
+  and `required: ["ids"]`: it accepts no handles, so `ids` is genuinely
+  mandatory there and no padding conflict is possible.
+- **`resolveTargets` normalizes before counting.** Blank and whitespace-only
+  entries are dropped from `ids` (no provider has an empty-string message id, so
+  one can never name a message), and `selection`/`receipt` are trimmed. A list
+  that held nothing usable counts as unset rather than as a competing selector.
+- **The two-selector refusal now spells out the corrected calls**, quoting the
+  caller's own handle: *"send ids as [] (or omit it): {"selection": "sel_…"}"*.
+  A model that lands there is padding, not confused about the contract, so
+  restating the rule leaves it varying the placeholder and retrying. This is the
+  same lesson terva learned with `session_inspect`'s `expand: 0`, where zero was
+  both a padding value and a meaningful one.
+- **A schema test pins the invariant**, since the bug lived entirely in the
+  schema and no Go test could have caught it: the organize schemas must not set
+  `minItems` on `ids`, must keep `maxItems`, and `email_destroy` must keep both.
+- **`contextPolicy` names the inert values**, because the schema description is
+  not the only place a model looks.
+
+The general rule, worth applying to anything added later: **when a tool offers
+mutually exclusive parameters, every one of them needs a representable "not this
+one" value, and the schema must permit it.**
+
 ## Safety invariants (all phases)
 
 - stdout is the wire; all logging via `Logf`/stderr.

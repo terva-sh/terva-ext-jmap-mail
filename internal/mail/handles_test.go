@@ -552,3 +552,101 @@ func TestTrashAcceptsSelectionAndReceipt(t *testing.T) {
 		t.Error("a trash receipt applied as a move")
 	}
 }
+
+// A model that pads every declared property rather than omitting keys must
+// still be able to use a handle. v0.13.0 shipped `ids` with minItems:1, so the
+// empty array meaning "not this way" was schema-invalid and the model
+// substituted ["placeholder"] — which read as a second selector and refused
+// every selection-based call in a 2,000-message wave. These are the exact
+// argument objects from that transcript.
+func TestPaddedIDsDoNotDefeatAHandle(t *testing.T) {
+	s, _ := handleService(t, 25)
+	ctx := context.Background()
+	page := searchSelection(t, s)
+
+	// Every inert form the observed model reached for, plus the one it could
+	// not express at the time.
+	for _, padding := range [][]string{
+		nil,
+		{},
+		{""},
+		{"  "},
+		{"", ""},
+	} {
+		dry, err := s.Move(ctx, MoveParams{
+			IDs: padding, Selection: page.SelectionID, SelectionOffset: 0,
+			Receipt: "", ToMailbox: "archive", DryRun: true,
+		})
+		if err != nil {
+			t.Fatalf("ids padded with %q refused the selection: %v", padding, err)
+		}
+		if dry.Selection == nil || dry.Selection.Count != 25 {
+			t.Errorf("ids padded with %q resolved to %+v", padding, dry.Selection)
+		}
+		// And the receipt path takes the same padding.
+		applied, err := s.Move(ctx, MoveParams{IDs: padding, Selection: "", Receipt: dry.ReceiptID})
+		if err != nil {
+			t.Fatalf("ids padded with %q refused the receipt: %v", padding, err)
+		}
+		if applied.MovedCount != 25 {
+			t.Errorf("movedCount = %d", applied.MovedCount)
+		}
+	}
+
+	// Padded string selectors stay inert on the ids path, including whitespace.
+	if _, err := s.Move(ctx, MoveParams{
+		IDs: page.IDs[:2], Selection: " ", Receipt: "", ToMailbox: "archive", DryRun: true,
+	}); err != nil {
+		t.Errorf("padded selection/receipt refused the ids path: %v", err)
+	}
+}
+
+// The padding fix must not soften the actual ambiguity: two real selectors is
+// still a refusal, because there is no way to know which was meant.
+func TestTwoRealSelectorsStillRefused(t *testing.T) {
+	s, _ := handleService(t, 25)
+	ctx := context.Background()
+	page := searchSelection(t, s)
+
+	_, err := s.Move(ctx, MoveParams{
+		IDs: []string{"placeholder"}, Selection: page.SelectionID, ToMailbox: "archive", DryRun: true,
+	})
+	if err == nil {
+		t.Fatal("a non-empty ids alongside a selection was accepted")
+	}
+	// The refusal has to name the corrected calls, not just the rule — the
+	// model that lands here is padding, and needs telling which inert value to
+	// use. Without that it varies the placeholder and retries indefinitely.
+	for _, want := range []string{"ids as []", page.SelectionID, "not this one"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal never mentions %q: %v", want, err)
+		}
+	}
+
+	// Naming nothing at all is still its own, different error.
+	_, err = s.Move(ctx, MoveParams{IDs: []string{}, Selection: "", Receipt: "", ToMailbox: "archive"})
+	if err == nil || !strings.Contains(err.Error(), "name the messages") {
+		t.Errorf("naming nothing = %v, want the name-the-messages error", err)
+	}
+}
+
+// Blank entries inside a real id list cannot name a message, so they are
+// dropped rather than sent to the provider.
+func TestBlankIDsAreDroppedFromARealList(t *testing.T) {
+	s, f := handleService(t, 5)
+	page := searchSelection(t, s)
+
+	res, err := s.Move(context.Background(), MoveParams{
+		IDs: []string{page.IDs[0], "", page.IDs[1], "   "}, ToMailbox: "archive", DryRun: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sent := stringifyIDs(lastBatch(t, f.fake, "Email/get")[0])
+	if len(sent) != 2 || sent[0] != page.IDs[0] || sent[1] != page.IDs[1] {
+		t.Errorf("provider received %v, want the two real ids", sent)
+	}
+	if res.MovedCount != 2 {
+		t.Errorf("movedCount = %d, want 2", res.MovedCount)
+	}
+}
