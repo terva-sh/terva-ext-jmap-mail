@@ -63,7 +63,7 @@ func TestAuditDetailNeverCarriesMessageContent(t *testing.T) {
 	args := `{"accountId":"u1","mailbox":"inbox","text":"` + query + `","from":"` + sender + `",
 		"subject":"` + subject + `","body":"` + body + `",
 		"filterJson":{"text":"` + query + `"},
-		"ids":["Sx1","Sx2"],"confirm":"move 2 emails to Archive in account u1 [batch abc123]",
+		"ids":["Sx1","Sx2"],"handle":"","confirm":"move 2 emails to Archive in account u1 [batch abc123]",
 		"toMailbox":"Archive","dryRun":true,"fields":["id"],"limit":200}`
 
 	sentinels := []string{subject, sender, preview, body, query,
@@ -83,6 +83,37 @@ func TestAuditDetailNeverCarriesMessageContent(t *testing.T) {
 		if account != "u1" {
 			t.Errorf("%s: account = %q, want the resolved account", tool, account)
 		}
+	}
+}
+
+// A destroy applied by receipt sends no ids at all, so the record has to be
+// assembled from the other end. It is the only record that will ever exist of
+// these messages, and "handle: rcp_…" alone would not be one.
+func TestAuditDetailDescribesAReceiptDrivenDestroy(t *testing.T) {
+	args := `{"accountId":"u1","handle":"rcp_5c81af","ids":[],"selectionOffset":0,
+		"allowNotInTrash":false,"dryRun":false,"confirm":""}`
+	result := `{"accountId":"u1","destroyed":[
+			{"id":"Sx1","subject":"SENTINEL-A"},{"id":"Sx2","subject":"SENTINEL-B"}],
+		"replayed":false,"note":"destroy is PERMANENT and unrecoverable"}`
+	detail, account := AuditDetail(json.RawMessage(args), json.RawMessage(result))
+
+	if account != "u1" {
+		t.Errorf("account = %q", account)
+	}
+	if detail["mode"] != "receipt" || detail["handle"] != "rcp_5c81af" {
+		t.Errorf("the record does not say the destroy was authorized by a receipt: %v", detail)
+	}
+	ids, _ := detail["destroyedIds"].([]string)
+	if len(ids) != 2 {
+		t.Fatalf("destroyedIds = %v — the ids are the only surviving evidence", detail["destroyedIds"])
+	}
+	// Nothing arrived on the args side to summarize, and inventing an idCount
+	// from the result would make a receipt call look like an ids call.
+	if _, ok := detail["idCount"]; ok {
+		t.Errorf("a receipt-driven call was recorded as having named ids: %v", detail)
+	}
+	if rendered, _ := json.Marshal(detail); strings.Contains(string(rendered), "SENTINEL") {
+		t.Errorf("subjects reached the destroy record: %s", rendered)
 	}
 }
 
@@ -124,7 +155,7 @@ func TestAuditDetailKeepsDestroyedIDsAndNotTheirSubjects(t *testing.T) {
 // A mutation's record has to be enough to answer "what changed, where, on
 // whose say-so" without the mailbox in front of you.
 func TestAuditDetailDescribesAMutation(t *testing.T) {
-	args := `{"accountId":"u1","receipt":"rcp_9a1c4e","ids":[],"selection":"","toMailbox":"Archive"}`
+	args := `{"accountId":"u1","handle":"rcp_9a1c4e","ids":[],"toMailbox":"Archive"}`
 	result := `{"accountId":"u1","movedCount":200,
 		"destination":{"id":"P3V","name":"Archive","role":"archive"},
 		"sources":[{"id":"P-F","name":"Inbox","role":"inbox","count":200}],
@@ -134,7 +165,7 @@ func TestAuditDetailDescribesAMutation(t *testing.T) {
 	if account != "u1" {
 		t.Errorf("account = %q", account)
 	}
-	if detail["movedCount"] != float64(200) || detail["receipt"] != "rcp_9a1c4e" {
+	if detail["movedCount"] != float64(200) || detail["handle"] != "rcp_9a1c4e" || detail["mode"] != "receipt" {
 		t.Errorf("detail = %v", detail)
 	}
 	dest, _ := detail["destination"].(map[string]any)
@@ -188,7 +219,7 @@ func TestAuditDetailSummarizesIDsRatherThanListingThem(t *testing.T) {
 
 // Blank and padded values must not fill the log with restated defaults.
 func TestAuditDetailDropsPaddedArguments(t *testing.T) {
-	args := `{"accountId":"","ids":["","  "],"selection":"","receipt":"","selectionOffset":0,
+	args := `{"accountId":"","ids":["","  "],"handle":"","selectionOffset":0,
 		"dryRun":false,"verbose":false,"fields":[],"mailboxes":[],"limit":0,"toMailbox":""}`
 	detail, account := AuditDetail(json.RawMessage(args), nil)
 	if account != "" {
@@ -208,5 +239,150 @@ func TestAuditDetailSurvivesGarbage(t *testing.T) {
 	}
 	if account != "" {
 		t.Errorf("account = %q", account)
+	}
+}
+
+// TW-045's first named cost was the audit record: reconstructing which
+// protocol a wave used meant classifying 139 calls by testing fields for
+// emptiness. A record now says which mode it was.
+func TestAuditDetailStatesTheTargetMode(t *testing.T) {
+	for _, tc := range []struct{ args, want string }{
+		{`{"handle":"sel_84ee6b","selectionOffset":0,"ids":[]}`, "selection"},
+		{`{"handle":"rcp_d18707","ids":[]}`, "receipt"},
+		{`{"ids":["Sx1","Sx2"],"handle":""}`, "ids"},
+		{`{"handle":"xyz_bogus","ids":[]}`, "unknown"},
+		// A tool that names no target set must not have a mode invented for it.
+		{`{"mailbox":"inbox","fields":["id"]}`, ""},
+		// Nor a call that named nothing at all — it was refused.
+		{`{"ids":[],"handle":"","toMailbox":"Archive"}`, ""},
+	} {
+		detail, _ := AuditDetail(json.RawMessage(tc.args), nil)
+		got, _ := detail["mode"].(string)
+		if got != tc.want {
+			t.Errorf("%s → mode %q, want %q (detail %v)", tc.args, got, tc.want, detail)
+		}
+	}
+}
+
+// The aggregates are the first tools whose RESULTS are made of third-party
+// content: a group key is a sender address, and a count's echoed filter is a
+// description of what the mailbox holds. Both are exactly the material the
+// allow-list exists to keep out of a durable log, and both arrive in fields
+// that did not exist when it was written — which is the case a redaction pass
+// would have failed and this one must not.
+func TestAuditDetailKeepsAggregateShapeAndNotItsContent(t *testing.T) {
+	group := `{"accountId":"u1","groupBy":"from","matched":3166,"scanned":3166,
+		"queryState":"qs-9","distinctKeys":214,"otherTotal":812,
+		"query":{"inMailbox":"P-F","text":"SENTINEL-QUERY"},
+		"groups":[
+			{"key":"SENTINEL-SENDER@third-party.test","total":412,"unread":9,
+			 "newest":"2026-07-01T00:00:00Z","oldest":"2025-01-01T00:00:00Z"},
+			{"key":"other@third-party.test","total":88,"unread":0}]}`
+	detail, account := AuditDetail(nil, json.RawMessage(group))
+	if account != "u1" {
+		t.Errorf("account = %q", account)
+	}
+	if detail["matched"] != float64(3166) || detail["scanned"] != float64(3166) {
+		t.Errorf("the shape of the scan was not recorded: %v", detail)
+	}
+	if detail["groupCount"] != 2 {
+		t.Errorf("groupCount = %v, want the number of rows", detail["groupCount"])
+	}
+	if _, ok := detail["groups"]; ok {
+		t.Error("the group rows themselves reached the log")
+	}
+	rendered, _ := json.Marshal(detail)
+	if strings.Contains(string(rendered), "SENTINEL") || strings.Contains(string(rendered), "third-party") {
+		t.Errorf("a sender address reached the audit record:\n%s", rendered)
+	}
+
+	count := `{"accountId":"u1","queryState":"qs-9","statesDiffered":true,
+		"counts":[{"label":"SENTINEL-LABEL","total":42,
+			"query":{"from":"SENTINEL-SENDER@third-party.test"}}]}`
+	detail, _ = AuditDetail(nil, json.RawMessage(count))
+	if detail["countRows"] != 1 {
+		t.Errorf("countRows = %v", detail["countRows"])
+	}
+	if detail["statesDiffered"] != true {
+		t.Error("a table that did not reconcile was recorded as if it had")
+	}
+	rendered, _ = json.Marshal(detail)
+	if strings.Contains(string(rendered), "SENTINEL") {
+		t.Errorf("a count's label or filter reached the audit record:\n%s", rendered)
+	}
+}
+
+// A bulk run that stopped half-way is precisely what an operator needs from a
+// log, and none of it is content.
+func TestAuditDetailRecordsAPartialBulkRun(t *testing.T) {
+	result := `{"accountId":"u1","movedCount":1000,"aborted":true,"appliedTo":1000,
+		"remainingCount":1000,"remainingSelectionId":"sel_ff01",
+		"abortReason":"connection reset","destination":{"id":"P3V","name":"Archive"}}`
+	detail, _ := AuditDetail(json.RawMessage(`{"handle":"rcp_1","ids":[]}`), json.RawMessage(result))
+	for _, key := range []string{"aborted", "appliedTo", "remainingCount", "movedCount"} {
+		if _, ok := detail[key]; !ok {
+			t.Errorf("a half-landed wave did not record %q: %v", key, detail)
+		}
+	}
+}
+
+// Failure groups reach the log as cause and count and nothing else. The group
+// is the one result field that carries both a server-written string and raw
+// message ids, so it is exactly the field an allow-list has to be careful with.
+func TestAuditDetailRecordsFailureCausesNotTheirContents(t *testing.T) {
+	result := `{"accountId":"u1","movedCount":1500,
+		"failures":[
+			{"type":"forbidden","count":400,"reason":"SENTINEL-SERVER-PROSE","selectionId":"sel_aa"},
+			{"type":"notFound","count":100,"ids":["SENTINEL-ID-1","SENTINEL-ID-2"]}],
+		"failureNote":"each failure group carries a selectionId ..."}`
+	detail, _ := AuditDetail(nil, json.RawMessage(result))
+
+	groups, _ := detail["failures"].([]map[string]any)
+	if len(groups) != 2 {
+		t.Fatalf("failures = %v, want both causes", detail["failures"])
+	}
+	if groups[0]["type"] != "forbidden" || groups[0]["count"] != 400 {
+		t.Errorf("group = %v, want cause and count", groups[0])
+	}
+	rendered, _ := json.Marshal(detail)
+	for _, bad := range []string{"SENTINEL", "sel_aa", "reason", "failureNote"} {
+		if strings.Contains(string(rendered), bad) {
+			t.Errorf("audit record carries %q:\n%s", bad, rendered)
+		}
+	}
+}
+
+// The group rows carrying the new per-group handles are made of sender
+// addresses, so the rows must not reach the log. The top-level selectionId is
+// a different case and stays: within one wave it ties the call that minted a
+// handle to the call that consumed it, which is what makes a log of forty
+// records readable as one operation.
+func TestAuditDetailDropsHandlesAndGroupRows(t *testing.T) {
+	group := `{"accountId":"u1","groupBy":"from","matched":412,"scanned":412,
+		"handleNote":"each group carries a selectionId ...",
+		"groups":[{"key":"SENTINEL-SENDER@x.test","total":412,"selectionId":"sel_zz"}]}`
+	detail, _ := AuditDetail(nil, json.RawMessage(group))
+	if detail["groupCount"] != 1 || detail["matched"] != float64(412) {
+		t.Errorf("shape lost: %v", detail)
+	}
+	thread := `{"accountId":"u1","threadId":"T1","count":125,"returned":100,"omitted":25,
+		"selectionId":"sel_yy","selectionNote":"names all 125 ...",
+		"emails":[{"id":"Sx1","subject":"SENTINEL-SUBJECT"}]}`
+	detail2, _ := AuditDetail(nil, json.RawMessage(thread))
+	if detail2["omitted"] != float64(25) || detail2["messageCount"] != 1 {
+		t.Errorf("thread shape lost: %v", detail2)
+	}
+	if detail2["selectionId"] != "sel_yy" {
+		t.Errorf("the correlating handle was dropped: %v", detail2)
+	}
+	for _, d := range []map[string]any{detail, detail2} {
+		rendered, _ := json.Marshal(d)
+		// sel_zz rides inside a group row; those are never admitted, because a
+		// group key is a sender address.
+		for _, bad := range []string{"SENTINEL", "sel_zz", "handleNote", "selectionNote"} {
+			if strings.Contains(string(rendered), bad) {
+				t.Errorf("audit record carries %q:\n%s", bad, rendered)
+			}
+		}
 	}
 }

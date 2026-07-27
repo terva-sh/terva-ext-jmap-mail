@@ -867,6 +867,336 @@ tamper-proof evidence — anything that can write the data dir can rewrite it. A
 deployment needing more should ship the records off-host, which is why the
 format is JSON Lines a collector can tail without parsing help.
 
+## Field-report wave 7 (2026-07-26, v0.17.0)
+
+**TW-045: a mutation's mode was inferred from which fields are empty.** The
+organize tools named a target set three ways — `ids`, `selection`, `receipt` —
+and a caller sent one while padding the others inert. Nothing was *wrong*:
+mixed-mode calls were already refused, so there was no correctness gap. The
+cost was that **a call did not state its own mode**; a reader derived it by
+testing three fields for emptiness. That landed on the audit record (139 calls
+classified by `if args.get("selection")`), on recovery after interruption, on
+the model reading its own transcript back, and on ~300 characters of
+documentation explaining that `[]`, `""` and an absent key all mean the same
+thing.
+
+The report is right that this extension already had the answer: TW-032's
+`returnIds` is a string enum with an inert `""`, chosen over a boolean because
+a padding model sends the zero value. That is the house pattern.
+
+**Shipped a third shape, not either of the two proposed.** `selection` and
+`receipt` merge into one **`handle`**, and the `sel_` / `rcp_` prefix says
+which. The mode is read off a value the caller supplied rather than inferred
+from which key is blank, and — unlike a `by` discriminator — this *removes* a
+field rather than adding one.
+
+- **The description got shorter, which was an acceptance criterion and the
+  hardest one.** `targetProperties` + `descTargets` went 1,643 → 1,449
+  characters, **−194**. A `by` field would have added ~200 to delete ~150, so
+  it could not have met this; separate tools (`email_move_by_selection` and
+  friends) would have taken the organize surface from 4 tools to 10, against a
+  fleet that had just filed TW-035 about not knowing which tools it holds.
+- **`resolveTargets` collapses from a three-way count to two selectors** and a
+  prefix switch. An unrecognised prefix is refused by naming what the two kinds
+  look like, rather than "unknown handle".
+- **The inert-value guarantees are unchanged**, and pinned: padded `ids` in
+  every shape (`nil`, `[]`, `[""]`, `["  "]`) alongside a real handle, a padded
+  handle alongside real ids, two real selectors still refused with the caller's
+  own handle quoted, and naming nothing still its own distinct error.
+- **`selection` and `receipt` remain accepted as undocumented argument
+  aliases.** Not for the model, which re-reads the schema each session — for
+  the wave in flight when a deployment lands. A batch that starts refusing
+  halfway through is this extension's most expensive failure (TW-027), and a
+  rename is not worth risking it. Two *different* values are still refused.
+- **The audit record now states `mode`** (`ids` | `selection` | `receipt`),
+  which settles TW-045's first named cost directly rather than leaving the log
+  to reproduce the derivation it complained about.
+
+Verified end to end against the hermetic server, including the fully padded
+call a padding model actually sends, and against the emitted schema from the
+built binary — `email_move` declares `ids`, `handle`, `selectionOffset` and no
+`selection` or `receipt`.
+
+## email_destroy joins the selection protocol (2026-07-26, v0.18.0)
+
+Found by sweeping for the pattern behind TW-045 rather than by a field report.
+`email_destroy` was the last mutating tool naming its targets only by `ids`:
+`required: ["ids"]`, `minItems: 1`, up to 200 ids transcribed by the model into
+the dry run and then again into the apply. Every recoverable sibling had been
+off that path since v0.13.0. The tool still on it was the unrecoverable one.
+
+**Same protocol as the others, with three deliberate departures.** A dry run
+now mints a `rcp_` receipt; a `sel_` selection from `email_search` feeds the
+preview; the chain is `search → sel_ → dryRun → rcp_ → apply` and no id is ever
+retyped.
+
+- **The receipt replaces the confirm phrase**, as it does for move/mark/trash.
+  This is the change to argue with, so: the receipt is strictly the stronger
+  authorization. It cannot exist without a preview that actually ran, it *is*
+  the id set rather than a 3-byte digest of it, it records the gate it ran
+  under, and `getReceipt` refuses it to any other tool. Requiring both would
+  only make the safer path the more expensive one.
+- **Departure 1 — the receipt covers the candidates, not the request.** When
+  the Trash gate holds messages back, the preview's phrase names every id asked
+  about and a real run using it is refused by that same gate; the receipt names
+  only what the preview cleared. Both are in the same result, so the result now
+  says which is usable. That mismatch predates this change — the phrase from a
+  partially-blocked preview was never usable — and is what makes the receipt
+  the answer rather than a convenience.
+- **Departure 2 — drift aborts instead of being reported.** Move and trash
+  report `drifted` and act anyway, because the message still lands where the
+  caller wanted. A message that left Trash since the preview was pulled back
+  out by something, and there is no undo for reading that wrong. Costs one
+  re-preview. `TestTrashStillProceedsThroughDriftWhereDestroyRefuses` runs the
+  same drift through both tools and requires them to disagree, so a later
+  "consistency" fix has to argue with a test.
+- **Departure 3 — a third receipt state: sent, outcome unrecorded.** For the
+  recoverable tools a failed claim is simply dropped, since repeating a move is
+  a no-op. For destroy a lost response after the server processed it means a
+  retry finds the ids gone and reports `notFound` — which reads as *nothing
+  happened* on the one occasion when everything did. The receipt refuses and
+  says to go and look.
+
+`required` and `minItems: 1` had to go with the change: the moment a handle
+could name the set, that pair made the inert `[]` schema-invalid on exactly the
+calls using the safer selector — the v0.13.0 defect (nineteen refusals, a
+2,000-message wave that archived nothing), re-aimed at the tool that cannot be
+undone. The schema-invariant test that used to assert destroy was the exception
+now asserts the opposite, with the reason in place.
+
+Verified against the emitted schema from the built binary, against the hermetic
+server end to end including replay, and with the two new guards mutation-tested
+to confirm they fail when removed. `docs/tool-design-practices.md` §1.4 gained
+the generalization: reversibility, not consistency, decides whether drift
+reports or refuses.
+
+## email_sieve_mark_applied stops guessing (2026-07-26, v0.19.0)
+
+The second finding from the same sweep, and the one the practices doc had been
+carrying as an open example. `MarkApplied` late-bound `version: 0` to head —
+where `0` is also the padded value *and* what an absent key decodes to, so the
+default call recorded "whatever head is right now" as the thing the user had
+confirmed pasting.
+
+Those are different claims whenever a `put` lands while the paste is in
+progress, which is exactly when it is most likely: the agent emits v5, the user
+goes to the web UI, something appends v6, the confirmation records v6. Nothing
+downstream can notice — every later diff is taken *from* the applied pointer,
+so a wrong pointer yields a store that agrees with itself indefinitely. Same
+failure shape as TW-036: wrong and self-consistent.
+
+**`version` is now mandatory in effect on the write, and nowhere else.**
+
+- **Not enforced in the schema.** `version` keeps `minimum: 0` and stays out of
+  `required`, so a padding model's `0` reaches the tool and gets a sentence it
+  can act on rather than a validation failure whose text it never sees. The
+  refusal names head, names the applied pointer it would overwrite, and says
+  why head is the wrong guess.
+- **The reads keep their defaults**, and should: late binding is only hazardous
+  where the call asserts something about the outside world. `get`, `diff` and
+  `put` all already reported the version they resolved or created, so the
+  number the write demands is always one line up in the transcript — the two
+  read schemas now say so explicitly.
+- **Not a handle**, though that was the first instinct and is what the practices
+  doc originally prescribed. A handle bets that the preview→apply gap is
+  machine time; here it is a human pasting into a web UI, unbounded and
+  spanning restarts. A 15-minute TTL would expire in a large share of real
+  uses, leaving the fallback to carry the correctness anyway. `docs/tool-design-practices.md`
+  §4.1 now records that precondition, because the wrong reflex is to reach for
+  the handle every time.
+
+The trade is explicit: an integer is weaker than a handle, and a model can
+still pass a version nobody looked at. What it cannot do is pass one *without
+saying so* — the claim is now in the arguments, the transcript and the audit
+record. Turning a silent inference into a checkable assertion was the available
+win.
+
+Existing tests that used `MarkApplied(k, 0, …)` as shorthand for head were
+naming versions all along; they now say which. The new test reproduces the
+v5/v6 timeline and asserts the diff taken afterwards still shows the unpasted
+change — the property that was actually at risk. The guard was mutation-tested.
+`skills/sieve-rules/SKILL.md` and the context policy were both teaching the old
+default and now teach the number.
+
+## Survey aggregates and the bulk-mutation cap (2026-07-26, v0.20.0)
+
+Three items from one fleet evidence file — a 107-call read-only survey and a
+139-call archive wave.
+
+**TW-047 / TW-048 — two new read tools, `email_count` and `email_group`.**
+`email_search` answers exactly one question per call: how many match this
+filter. A survey asks two things it structurally cannot answer — a
+distribution, and a table whose rows reconcile — so the agent emulated both.
+It dumped 200 newest + 200 oldest + list-tagged summaries to eyeball frequent
+senders (**244,664 bytes, 92% of the session's mail payload**, resident for
+every subsequent turn — 81% of the spend fell after they landed), then issued
+38 counters against its guesses. Forty-two of 62 searches served that one
+question, and the ranking was drawn from 12% of a 3,166-message mailbox taken
+from both ends, so a steady mid-volume sender was invisible and never counted.
+Separately, 57 of 62 searches were counters spelled `{limit:1,
+includeTotal:true, returnIds:"none"}` — fetch a message, read the envelope,
+discard the message, mint a selection nobody will use — each against its own
+`queryState`. The agent dropped into `bash` three times across two sessions to
+assert a mail tool's arithmetic, and was right to: a survey measured 3,166
+against a cleanup that had closed at 3,165.
+
+- **Two sibling tools, not a `groupBy` on `email_search`.** The report offered
+  both, but its own constraints for the parameter version — mutually exclusive
+  with `fields`, forces `returnIds:"none"` — describe a mode switch inside one
+  tool, which is what TW-045 was filed about. A separate tool states its mode
+  by existing. 17 → 19 tools.
+- **Neither can return a message.** No `fields`, no `returnIds`, no `limit`, no
+  `position`; a schema test pins their absence. `email_group` returns
+  `{key, total, unread, newest, oldest}` and deliberately drops the sender's
+  display name beside the address — it is third-party text, it varies between
+  messages from the same sender, and the address is what a rule would match.
+- **A grouped result states `matched` and `scanned`.** A ranking over a bounded
+  window is the sampling problem again unless the result says it is one.
+  Truncation also carries a note saying not to read the order as the mailbox's.
+- **`email_count` is bounded by the server's request budget, not by a number we
+  chose.** The guarantee it sells is that every row shared one request; letting
+  it split would sell something else. The refusal says so and tells the caller
+  to split into runs that each report their own state.
+- **The filter surface is shared verbatim** (`filterProperties` in the schema,
+  `filterArgs` in the decoder, pinned to each other by reflection test), so a
+  caller that has framed a search can count or group the identical set.
+- **Neither result reaches the audit log.** Group keys are sender addresses and
+  a count's echoed filter describes the mailbox — the allow-list keeps both out
+  by default, and now records only shape (`groupCount`, `countRows`, `matched`,
+  `scanned`, `truncated`, `statesDiffered`).
+
+**TW-049 — the handle cap, and the cap behind it.** A wave archived 13,797
+messages as 69 applies at a mean of 199.96 plus 70 dry runs: 139 calls, 500 of
+531 tool-bearing turns carrying exactly one call, 4h45m. The protocol was
+executed perfectly — every preview by selection, every apply by receipt, zero
+drift, zero replays, zero errors. The turn count was set by a 200-id cap that
+bounds *argument payload*, applied to a calling convention that carries none.
+
+- **Two caps, by how the set was named**: 200 for literal ids, 2,000 for a
+  handle. `targetSet.byHandle` carries the distinction from `resolveTargets`.
+- **Raising it alone would have bought nothing**, and this was the part not in
+  the report: a selection only ever holds one search page, and that page capped
+  at 500. So `returnIds:"none"` now lifts the page cap to 2,000 as well — with
+  the id array suppressed, a page enters the transcript as one selectionId
+  however large it is, which is the same argument one level up. The two caps
+  are deliberately equal, so a full page is exactly one apply: 13,797 messages
+  is 7 rounds of three calls rather than 139 calls.
+- **Chunked underneath**, sized to `min(maxObjectsInGet, maxObjectsInSet)`, one
+  chunk per request. Packing several chunks per request would be fewer round
+  trips and a worse failure story — no telling which of them landed.
+- **A stopped run reports where it stopped.** New `partialRun` block on both
+  mutation results: `aborted`, `appliedTo` (a boundary, not an estimate),
+  `abortReason`, and `remainingSelectionId` naming the untouched messages so
+  finishing is the same two calls as any other batch. A failure in the *first*
+  chunk stays an error — there is no partial outcome to describe, and dressing
+  it up as one would report a successful move of nothing.
+
+`skills/mail-triage/SKILL.md` step 1 is rewritten to lead with
+`email_list_mailboxes` → `email_group` → `email_count` and to say explicitly
+why surveying by listing is wrong twice over; its large-backlog section now
+teaches the 2,000-id page. The context policy gained both rules. Verified
+against the emitted schema from the built binary (19 tools, neither aggregate
+with a `required`, `groupBy` admitting `""` with no default, search limit
+2,000) and end to end against the hermetic server, including a count
+cross-checked against the search it replaces and a partial abort resumed
+through its remainder handle.
+
+`docs/tool-design-practices.md` gained §5.1 (if the model is post-processing
+your results in a loop, you are missing a tool) and §6 (a limit should bound
+the thing it names; caps compose, and the smallest governs).
+
+## Failures you can act on (2026-07-26, v0.20.0)
+
+A follow-on to the cap raise, from a question worth recording because the first
+answer to it was wrong. Asked: should there be a tool that turns a selectionId
+into its message ids? Answer: no — that undoes the measured win (10,082 → 1,491
+bytes, and the last step was the search *not* returning the array). But the
+reason for wanting one was real, and it pointed at the actual gap.
+
+**`email_get` now accepts a handle.** Any `sel_` or `rcp_` id, because a read
+authorizes nothing — a handle there is only a name, so unlike the mutating path
+the receipt's kind is not checked. Its cap stays at 20 and slices, which is
+[§6](tool-design-practices.md) applied in the opposite direction: the mutating
+cap rose because it bounded ids going out and a handle carries none, while this
+one bounds bodies coming back and a handle does nothing about that. Same token,
+opposite conclusion.
+
+**Failures come back grouped by cause, each group carrying a handle.** A list
+of failed ids is not what a caller wants: a bare id identifies nothing to a
+person and cannot be acted on without sending them all back. What a caller
+wants is to see the failures (`email_get handle:…` → subjects and placements)
+or retry them (the same handle back into the organize tool). Groups are per
+cause, not one for everything, because the remedies differ and one of them is
+"there is no remedy" — a `notFound` group fails every retry, so folding it in
+guarantees a wasted call each time.
+
+This also closes a hole the cap raise opened and I had not addressed:
+`Failed`/`NotFound` were documented as *never abridged*, which was survivable
+when a run was at most 200 messages and is the payload problem itself at 2,000.
+Above the enumerate threshold the flat lists now give way to the groups, which
+carry the same information in a few rows. Below it nothing changes — at five
+messages the ids are the answer and a handle would be ceremony.
+
+**Handle capacity split.** `maxHandles` was 64 shared; selections now get 256,
+receipts keep 64. A wave mints selections faster than it consumes them — one
+per search page, one per failure cause, one for a partial run's tail — and
+eviction is oldest-first, so the handle about to go would have been a live
+receipt from the round still in progress.
+
+Audit records failure groups as cause and count only: `reason` is server prose,
+`ids` are message ids outside the destroy exception, and `selectionId` names an
+in-memory handle that is dead fifteen minutes after the record is written.
+
+## Handles from the tools that already held the ids (2026-07-26, v0.20.0)
+
+A sweep of all nineteen tools against one question: **does this tool hold a set
+of message ids that a later call would otherwise re-derive?** Three did.
+
+- **`email_group` emits a handle per group.** The fold already held each
+  group's members and threw them away, so "archive everything from the top
+  sender" cost another query per row — the shape this tool was built to
+  remove, one level up. Acting on a row is now the handle straight into
+  email_move.
+- **`email_group` accepts a handle.** JMAP has no id filter, so a set that is
+  not expressible as a query could not be grouped at all. "Are these four
+  hundred failures all one sender" is now a call. No query is issued and no
+  queryState is reported, because none was taken.
+- **`email_get_thread` emits a handle naming the whole thread** — including the
+  messages the display cap omitted, since Thread/get returns the complete
+  emailIds list regardless of how many are then fetched. Archiving a
+  150-message thread after reading the newest 100 is one further call, and
+  correct. The result says so, because "acts on more than you were shown" is
+  not something a caller should have to infer.
+
+**The subset trap, and why grouping withholds handles on a truncated scan.** A
+handle over a scanned window would name part of a group while reading as all of
+it, so "archive everything from this sender" would archive some of it,
+silently — the sampling failure the tool exists to end, reintroduced through a
+token. Refusing to mint is the only version that cannot mislead; the result
+says why and what to raise. The thread case is the mirror image and safe for
+the opposite reason: its handle is a superset of what was displayed, not a
+subset of what was scanned.
+
+**Deliberately not built**, each for a stated reason rather than by omission:
+`email_count` emits none (it runs limit 0 precisely so no ids come back;
+minting would require fetching them and undo the tool's defining property);
+`email_search` does not accept one to narrow (no id filter server-side, so it
+would be a client-side intersection over a stale pinned set, when a tighter
+filter is cheaper and stays authoritative); `email_get` emits none (the caller
+already holds whatever handle it passed); status / list_accounts /
+list_mailboxes have no message sets; the seven sieve tools have no message ids
+at all.
+
+Handles are also withheld at read-only access level in both new places, where
+the tools that consume them are withdrawn and the token would be noise in every
+result.
+
+One correction this turn: a comment claimed the audit projection admits no
+selectionId anywhere. It does, at the top level, and deliberately — within one
+wave it is what ties the search that minted a handle to the move that consumed
+it. What stays out is the per-group and per-failure handles, which ride inside
+rows that are not allow-listed because a group key is a sender address.
+
 ## Safety invariants (all phases)
 
 - stdout is the wire; all logging via `Logf`/stderr.

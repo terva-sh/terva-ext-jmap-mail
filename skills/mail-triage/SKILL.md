@@ -22,14 +22,49 @@ exact `/extensions` change the user would make to let you execute
 
 ## 1. Survey — where is the volume?
 
-- `email_list_mailboxes` (counts on by default): unread hotspots, oversized
-  folders. Use the returned `path`s when reporting — `Inbox/Gaming/Star
-  Citizen` reads better than an id.
-- Slice the backlog with `email_search` + `includeTotal: true`:
-  unread (`notKeyword: "$seen"`), stale unread (`before` a cutoff),
-  mailing lists (`keyword: "$ismailinglist"`), high-volume senders.
-- For each repeated sender worth a rule, get the real count:
-  `email_search {from: X, includeTotal: true, limit: 1}` is a cheap counter.
+Three calls, in this order. None of them returns a message.
+
+1. `email_list_mailboxes` (counts on by default): unread hotspots, oversized
+   folders. Use the returned `path`s when reporting — `Inbox/Gaming/Star
+   Citizen` reads better than an id.
+2. `email_group {mailbox: "inbox", groupBy: "from"}` — **who is filling it**,
+   exactly, ranked, with unread counts and date ranges per sender. This is the
+   shortlist; you do not have to guess at it.
+3. `email_count {queries: [...]}` — the table that has to add up. One labeled
+   row each for unread, stale unread (`before` a cutoff), mailing lists
+   (`keyword: "$ismailinglist"`), flagged, and whatever else the plan needs.
+   Every row is measured against one server state, so the rows reconcile with
+   the total and with each other.
+
+`email_group {groupBy: "receivedAt", interval: "month"}` gives the age
+histogram in one call if the plan needs one.
+
+Every group comes back with a `selectionId` naming its messages. Acting on a
+row is that handle straight into `email_move` / `email_mark` / `email_trash` —
+never a second search to re-find what the grouping already had. (Handles are
+absent when the result is `truncated`: over a scanned window a handle would
+name part of a group while reading as all of it. Raise `maxMessages` first.)
+
+`email_group` also *takes* a handle, which is how you ask about a set no filter
+can express — `{handle: <a failure group's selectionId>, groupBy: "from"}`
+answers "are these all one sender?".
+
+**Do not survey by listing.** Dumping a few hundred message summaries to
+eyeball frequent senders and then counting each guess is the wrong shape twice
+over: it ranks the mailbox from its newest and oldest ends, so a steady
+mid-volume sender is invisible and never gets counted at all, and the summaries
+stay in context for every turn that follows. Measured on a 3,166-message Inbox,
+that pattern cost 92% of the session's mail payload and most of its spend.
+The counts it produced were exact; the choice of which senders to count was
+not, and nothing in the output said so.
+
+Read `matched` and `scanned` on a grouped result. If `truncated` is set, the
+ranking covers a window rather than the mailbox — raise `maxMessages` or narrow
+the filter before treating the order as real.
+
+Individual counts still have their place once you are checking a single
+specific condition — `email_search {from: X, includeTotal: true, limit: 1}` —
+but reach for `email_count` the moment there is more than one number.
 
 ## 2. Identify candidates
 
@@ -83,25 +118,50 @@ applied. Archiving survives that (a moved message leaves the filter);
 marking read over a filter that does not self-exclude does not, so for those
 keep the cohort narrow enough to finish in one pass.
 
-Collect ids with a projection, not full summaries:
-`email_search {mailbox: "inbox", before: "…", fields: ["id"], limit: 500}`
-returns a flat `ids` array, paging metadata, and a `selectionId` — nothing
-else.
-
-**Never retype those ids.** The batch is three calls that each name the set
-once:
+Page as large as the tools allow, and do not let the ids into the transcript
+at all:
 
 ```
-email_search  fields:["id"] limit:500   → ids + selectionId
-email_move    selection:<selectionId> dryRun:true
-                                        → counts + confirmPhrase + receiptId
-email_move    receipt:<receiptId>       → counts
+email_search  fields:["id"] returnIds:"none" limit:2000
+                                     → selectionId, counts, queryState only
+email_move    handle:<selectionId> dryRun:true
+                                     → counts + receiptId
+email_move    handle:<receiptId>     → counts
 ```
 
-A mutating call takes at most 200 ids, so a 500-id selection is worked in
-slices: pass `selectionOffset` 0, then 200, then 400, and read
-`selection.remaining` in each result to know when to stop. The ids were pinned
-when the search ran, so moving one slice does not shift the next.
+**Three calls per 2,000 messages.** `returnIds: "none"` is what makes the big
+page free — no id array comes back, so the page reaches you as one token
+however many messages it names, and a 2,000-id selection is consumed by a
+single apply. A 13,797-message backlog is seven of these rounds, not sixty-nine.
+
+**Never retype ids.** Each call names the set once, and the handle's prefix
+says which kind it is: `sel_` came from a search, `rcp_` from a dry run. A
+receipt replaces the confirm phrase too, since the dry run already did the
+previewing.
+
+A selection larger than 2,000 is worked in slices: pass `selectionOffset` 0,
+then 2000, and read `selection.remaining` in each result to know when to stop.
+The ids were pinned when the search ran, so moving one slice does not shift the
+next.
+
+If an apply reports `aborted`, it stopped part-way: `appliedTo` messages
+landed, nothing after them was attempted, and `remainingSelectionId` names the
+untouched ones. Dry-run and apply that handle — do **not** re-run the original
+selection, which would redo work that already succeeded.
+
+If it reports `failures`, they are grouped by cause and each group carries a
+`selectionId` instead of a list of ids. Two things to do with it:
+
+- **Show the user what failed**: `email_get {handle: <that selectionId>,
+  fields: ["subject","from","mailboxes"]}`. A bare id tells nobody anything;
+  a subject and a placement do. The 20-message cap still applies here — this
+  one bounds what comes back, not what you send — so a large group is read in
+  slices.
+- **Retry just those**: pass the same handle back to the organize tool.
+
+Causes are separate handles deliberately. Retrying a `notFound` group will fail
+again — those messages are gone — so report those rather than re-attempting
+them.
 
 Above 20 ids the organize result reports `movedCount` and a per-source-mailbox
 breakdown instead of every subject line — the dry run's counts are what you are

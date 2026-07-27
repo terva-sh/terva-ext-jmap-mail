@@ -330,8 +330,47 @@ func TestBulkCountsKeepFailuresInFull(t *testing.T) {
 	if len(res.Moved) != 0 || res.MovedCount != 1 {
 		t.Errorf("moved = %v, movedCount = %d", res.Moved, res.MovedCount)
 	}
-	if res.Failed["e-2"] == "" || len(res.NotFound) != 1 || res.NotFound[0] != "e-1" {
-		t.Errorf("failed/notFound abridged: failed = %v, notFound = %v", res.Failed, res.NotFound)
+	// The flat lists give way to grouped handles above the enumerate threshold:
+	// at 2,000 messages a run can fail 500 of them, and 500 map entries is the
+	// payload this extension exists to keep out. What must NOT be lost is the
+	// information — every failure is still reported, by cause, with a handle
+	// naming exactly the affected messages.
+	if len(res.Failed) != 0 || len(res.NotFound) != 0 {
+		t.Errorf("a bulk run still shipped flat id lists: failed = %v, notFound = %v", res.Failed, res.NotFound)
+	}
+	byType := map[string]FailureGroup{}
+	for _, g := range res.Failures {
+		byType[g.Type] = g
+	}
+	if len(byType) != 2 {
+		t.Fatalf("failures = %+v, want one group per cause", res.Failures)
+	}
+	forbidden, ok := byType["forbidden"]
+	if !ok || forbidden.Count != 1 || forbidden.SelectionID == "" {
+		t.Errorf("forbidden group = %+v, want a count and a handle", forbidden)
+	}
+	if forbidden.Reason == "" {
+		t.Error("the group carries no description; the type alone is opaque")
+	}
+	notFound, ok := byType["notFound"]
+	if !ok || notFound.Count != 1 || notFound.SelectionID == "" {
+		t.Errorf("notFound group = %+v", notFound)
+	}
+	// The two causes get separate handles, because retrying a mixed set would
+	// retry the notFound ones — the one group a retry can never help.
+	if forbidden.SelectionID == notFound.SelectionID {
+		t.Error("both causes share one handle; retrying it would retry the unretryable")
+	}
+	if !strings.Contains(res.FailureNote, "email_get") {
+		t.Errorf("nothing says what the handles are for: %q", res.FailureNote)
+	}
+	// And the handle really names the failed message.
+	held, err := s.handles.getSelection(forbidden.SelectionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(held.IDs) != 1 || held.IDs[0] != "e-2" {
+		t.Errorf("forbidden handle names %v, want [e-2]", held.IDs)
 	}
 }
 

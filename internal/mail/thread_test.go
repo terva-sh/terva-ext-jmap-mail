@@ -236,3 +236,93 @@ func TestGetThreadNotFound(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+// A thread is a set worth naming, and here the handle can safely cover more
+// than the result: Thread/get returns the complete emailIds list whatever the
+// display cap does, so "archive this whole thread" is correct even when you
+// have only read the newest end of it.
+func TestThreadNamesTheWholeThreadEvenWhenTruncated(t *testing.T) {
+	const total = maxThreadSummaries + 25
+	ids := make([]string, 0, total)
+	for i := 0; i < total; i++ {
+		ids = append(ids, fmt.Sprintf("t%03d", i))
+	}
+	f := &fake{}
+	f.handler = func(calls []jmap.Invocation) *jmap.Response {
+		var out []jmap.InvocationResult
+		for _, c := range calls {
+			switch c.Name {
+			case "Thread/get":
+				out = append(out, result("Thread/get", c.CallID, map[string]any{
+					"list": []any{map[string]any{"id": "T1", "emailIds": ids}},
+				}))
+			case "Email/get":
+				list := make([]any, 0, len(ids))
+				for _, id := range ids {
+					list = append(list, map[string]any{
+						"id": id, "threadId": "T1", "subject": "Re: thread",
+						"keywords": map[string]bool{}, "mailboxIds": map[string]bool{"mb-inbox": true},
+					})
+				}
+				out = append(out, result("Email/get", c.CallID, map[string]any{"list": list}))
+			case "Mailbox/get":
+				out = append(out, result("Mailbox/get", c.CallID, map[string]any{"list": mailboxFixture}))
+			}
+		}
+		return response(out...)
+	}
+	s := testService(f)
+	ctx := context.Background()
+
+	res, err := s.GetThread(ctx, ThreadParams{ThreadID: "T1", Fields: []string{"id"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Omitted != 25 || res.Returned != maxThreadSummaries {
+		t.Fatalf("returned=%d omitted=%d", res.Returned, res.Omitted)
+	}
+	if res.SelectionID == "" {
+		t.Fatal("no handle named the thread")
+	}
+	held, err := s.handles.getSelection(res.SelectionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The whole thread, not the displayed slice — that is the property.
+	if len(held.IDs) != total {
+		t.Fatalf("handle names %d messages, want the thread's %d", len(held.IDs), total)
+	}
+	if held.IDs[0] != ids[0] {
+		t.Errorf("handle starts at %s, want the oldest message %s", held.IDs[0], ids[0])
+	}
+	// And it says so, because "acts on more than you were shown" must not be
+	// something a caller has to work out.
+	for _, want := range []string{"all 125", "25 not shown"} {
+		if !strings.Contains(res.SelectionNote, want) {
+			t.Errorf("selectionNote does not say the handle exceeds the result (%q): %q", want, res.SelectionNote)
+		}
+	}
+
+	// It is usable end to end.
+	dry, err := s.Move(ctx, MoveParams{Handle: res.SelectionID, ToMailbox: "archive", DryRun: true})
+	if err != nil {
+		t.Fatalf("thread handle unusable: %v", err)
+	}
+	if dry.Selection.Count != total {
+		t.Errorf("move over the thread covers %d, want %d", dry.Selection.Count, total)
+	}
+}
+
+// At read-only the tools that consume a handle are withdrawn, so minting one
+// would put a token nobody can use into every thread result.
+func TestThreadMintsNoHandleAtReadOnly(t *testing.T) {
+	f := threadFake()
+	s := readOnlyService(f)
+	res, err := s.GetThread(context.Background(), ThreadParams{ThreadID: "T1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.SelectionID != "" || res.SelectionNote != "" {
+		t.Errorf("read-only result carries an unusable handle: %+v", res.SelectionID)
+	}
+}

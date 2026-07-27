@@ -100,7 +100,7 @@ tools are `Sequential()`.
 | `email_sieve_diff` | local-read | unified diff between two versions (defaults: applied → head, i.e. "what's pending") |
 | `email_sieve_put` | local-data, Sequential | append a version (content or CWD-jailed sourcePath; lint + dryRun; contextOnly) |
 | `email_sieve_restore` | local-data, Sequential | append-restore of a prior version |
-| `email_sieve_mark_applied` | local-data, Sequential | set the applied pointer (defaults to head) after the user confirms pasting; refuses context-only and truncation-suspect versions |
+| `email_sieve_mark_applied` | local-data, Sequential | set the applied pointer to an explicitly named version after the user confirms pasting (never defaulted to head — v0.19.0); refuses context-only and truncation-suspect versions |
 | `email_sieve_archive` | local-data, Sequential | move a document aside (or back) — hidden, never deleted (v0.8.0) |
 
 Seven small tools; schemas stay terse. Named `email_sieve_*` per the
@@ -123,7 +123,13 @@ Fastmail-shaped, so RFC 9661 whole-script sync reuses them unchanged.
 3. **Emit** — the changed sections, each labeled with its editable-area
    placement ("replace the contents of area 2, below spam protection").
    Fastmail validates at save — the syntax gate at the end of the loop.
-4. **Confirm** — user says "applied"; agent `sieve_mark_applied`s.
+4. **Confirm** — user says "applied"; agent `sieve_mark_applied`s **the version
+   it emitted in step 3**, by number. Not head: step 3 and step 4 are separated
+   by a human pasting into a web UI, and any `sieve_put` in that gap moves head
+   without anything reaching the provider. Marking head then records a version
+   nobody pasted, and because every later diff is taken from the applied
+   pointer, the mistake reads as correct from that point on. The tool refuses a
+   call that does not name a version.
 
 ### RFC 9661 providers (future, Stalwart-first)
 

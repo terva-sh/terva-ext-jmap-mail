@@ -34,9 +34,20 @@ const (
 	// short enough that a handle cannot be presented in a later stretch of
 	// reasoning that has forgotten what it named.
 	handleTTL = 15 * time.Minute
-	// maxHandles bounds each kind independently. A 500-id selection is ~6 KB,
-	// so the ceiling is well under a megabyte even when full.
-	maxHandles = 64
+	// maxSelections and maxReceipts bound each kind independently.
+	//
+	// Selections got the larger ceiling once a wave started minting them faster
+	// than it consumed them: one per search page, one per failure class on a
+	// result, one for the tail of a partial run. Seven rounds of that is well
+	// past the 64 both kinds used to share, and eviction is oldest-first — so
+	// the handle to go would have been a live receipt from the round still in
+	// progress. A 2,000-id selection is ~24 KB, so 256 of them is under 6 MB
+	// even in the worst case, and the TTL means the worst case needs all of
+	// them minted inside fifteen minutes.
+	maxSelections = 256
+	// Receipts are minted once per dry run and consumed by the apply that
+	// follows, so nothing accumulates them the way selections do.
+	maxReceipts = 64
 )
 
 // selection is a search's ordered id set, held so a mutating call can name it
@@ -62,9 +73,10 @@ type selection struct {
 type receiptKind string
 
 const (
-	receiptMove  receiptKind = "move"
-	receiptTrash receiptKind = "trash"
-	receiptMark  receiptKind = "mark"
+	receiptMove    receiptKind = "move"
+	receiptTrash   receiptKind = "trash"
+	receiptMark    receiptKind = "mark"
+	receiptDestroy receiptKind = "destroy"
 )
 
 // receipt is a dry run's promise: this exact set, this exact operation. The
@@ -82,6 +94,11 @@ type receipt struct {
 	DestID, DestName, DestPath string
 	Keep                       bool
 	Action                     string // mark only
+	// AllowNotInTrash records which gate the destroy preview ran under. A
+	// preview that held messages back because they were outside Trash must not
+	// be applied by a call that has since switched the gate off — that apply
+	// would destroy a set the preview never showed.
+	AllowNotInTrash bool // destroy only
 	// Snapshot fingerprints each message's state as the preview saw it
 	// (placement for move/trash, the target keyword for mark). Comparing it at
 	// apply time detects the messages that moved underneath the caller — the
@@ -99,6 +116,15 @@ type receipt struct {
 	inFlight  bool
 	AppliedAt time.Time
 	result    any
+	// submitted records that the mutation actually reached the provider, set
+	// just before it goes on the wire. For the recoverable operations this is
+	// uninteresting — a move or a mark that may or may not have landed is safe
+	// to repeat, which is why releaseReceipt simply drops a failed claim. For
+	// destroy it is the whole question: if the response is lost after the
+	// server processed it, a silent retry finds the ids gone and reports
+	// "notFound", which reads as nothing happened when in fact everything did.
+	// See claimReceipt.
+	submitted bool
 }
 
 func (r *receipt) applied() bool { return !r.AppliedAt.IsZero() }
@@ -121,6 +147,17 @@ func newHandleStore() *handleStore {
 	}
 }
 
+// Handle prefixes. These are load-bearing, not decoration: one `handle`
+// parameter carries both kinds, and the prefix is what tells the caller and
+// the reader which protocol a call is using. Before v0.17.0 the mode was
+// inferred by testing three parallel fields for emptiness, which meant a call
+// did not state its own mode and a transcript had to be classified rather than
+// read (TW-045).
+const (
+	selectionPrefix = "sel_"
+	receiptPrefix   = "rcp_"
+)
+
 // newHandleID mints an opaque token. It is not a capability — the store is
 // per-process and reachable only by this extension — so the randomness is
 // hygiene against accidental collision and against a caller inferring one
@@ -139,10 +176,10 @@ func newHandleID(prefix string) string {
 func (h *handleStore) putSelection(sel *selection) string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	sel.ID = newHandleID("sel")
+	sel.ID = newHandleID(strings.TrimSuffix(selectionPrefix, "_"))
 	sel.CreatedAt = h.now()
 	h.selections[sel.ID] = sel
-	evict(h.selections, h.now(), func(s *selection) time.Time { return s.CreatedAt })
+	evict(h.selections, h.now(), maxSelections, func(s *selection) time.Time { return s.CreatedAt })
 	return sel.ID
 }
 
@@ -167,10 +204,10 @@ func (h *handleStore) getSelection(id string) (*selection, error) {
 func (h *handleStore) putReceipt(r *receipt) string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	r.ID = newHandleID("rcp")
+	r.ID = newHandleID(strings.TrimSuffix(receiptPrefix, "_"))
 	r.CreatedAt = h.now()
 	h.receipts[r.ID] = r
-	evict(h.receipts, h.now(), func(r *receipt) time.Time { return r.CreatedAt })
+	evict(h.receipts, h.now(), maxReceipts, func(r *receipt) time.Time { return r.CreatedAt })
 	return r.ID
 }
 
@@ -194,6 +231,38 @@ func (h *handleStore) getReceipt(id string, want receiptKind) (*receipt, error) 
 	return r, nil
 }
 
+// namedSet resolves a handle of either kind to the ids it names, for a READ.
+//
+// The mutating path deliberately cannot do this: there a receipt is an
+// authorization, so its kind is checked and a move receipt cannot be presented
+// to a mark. A read authorizes nothing, so a handle there is only a name for a
+// set, and any kind will do. "Show me the messages my dry run covered" is a
+// reasonable question, and after an apply the receipt is often the only thing
+// still naming them.
+func (h *handleStore) namedSet(id string) (accountID string, ids []string, err error) {
+	switch {
+	case strings.HasPrefix(id, selectionPrefix):
+		sel, err := h.getSelection(id)
+		if err != nil {
+			return "", nil, err
+		}
+		return sel.AccountID, sel.IDs, nil
+	case strings.HasPrefix(id, receiptPrefix):
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		r, ok := h.receipts[id]
+		if !ok {
+			return "", nil, fmt.Errorf("unknown receipt %q — receipts are held in memory for %s and are lost when the extension restarts", id, handleTTL)
+		}
+		if h.now().Sub(r.CreatedAt) > handleTTL {
+			delete(h.receipts, id)
+			return "", nil, fmt.Errorf("receipt %q expired (receipts live %s)", id, handleTTL)
+		}
+		return r.AccountID, r.IDs, nil
+	}
+	return "", nil, fmt.Errorf("handle %q is neither a selectionId (%s…) nor a receiptId (%s…)", id, selectionPrefix, receiptPrefix)
+}
+
 // claimReceipt is the apply-side gate, taken before any network call. It
 // returns the stored result when the receipt has already been applied (the
 // caller lost the original result and is asking again), and otherwise marks
@@ -207,8 +276,26 @@ func (h *handleStore) claimReceipt(r *receipt) (replay any, err error) {
 	if r.inFlight {
 		return nil, fmt.Errorf("receipt %q is already being applied — wait for that call to return rather than issuing a second one", r.ID)
 	}
+	// Reached the provider but never came back with a usable result. Only
+	// destroy ever sets this, and only destroy needs it: for an unrecoverable
+	// operation, "we do not know" is the honest answer and re-sending would
+	// paper over it with a notFound report that looks like a no-op.
+	if r.submitted {
+		return nil, fmt.Errorf("receipt %q was already sent to the provider and the outcome was not recorded — the messages may or may not be destroyed; check with email_search (in Trash) rather than presenting it again", r.ID)
+	}
 	r.inFlight = true
 	return nil, nil
+}
+
+// markSubmitted records that a receipt's mutation is going on the wire. Nil is
+// a no-op so the ids path needs no branch at the call site.
+func (h *handleStore) markSubmitted(r *receipt) {
+	if r == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	r.submitted = true
 }
 
 // releaseReceipt records the outcome of a claimed apply. On success the result
@@ -228,13 +315,13 @@ func (h *handleStore) releaseReceipt(r *receipt, result any, err error) {
 
 // evict drops expired entries, then the oldest surviving ones until the map is
 // within capacity.
-func evict[T any](m map[string]*T, now time.Time, createdAt func(*T) time.Time) {
+func evict[T any](m map[string]*T, now time.Time, max int, createdAt func(*T) time.Time) {
 	for id, v := range m {
 		if now.Sub(createdAt(v)) > handleTTL {
 			delete(m, id)
 		}
 	}
-	if len(m) <= maxHandles {
+	if len(m) <= max {
 		return
 	}
 	ids := make([]string, 0, len(m))
@@ -244,7 +331,7 @@ func evict[T any](m map[string]*T, now time.Time, createdAt func(*T) time.Time) 
 	sort.Slice(ids, func(i, j int) bool {
 		return createdAt(m[ids[i]]).Before(createdAt(m[ids[j]]))
 	})
-	for _, id := range ids[:len(m)-maxHandles] {
+	for _, id := range ids[:len(m)-max] {
 		delete(m, id)
 	}
 }

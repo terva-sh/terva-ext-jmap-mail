@@ -75,7 +75,10 @@ for drift checks but can never be marked applied.
    Optionally import the full export as a `contextOnly` document (see
    above) for whole-script context — never edit generated blocks; they can
    only change via Fastmail's UI.
-4. `email_sieve_mark_applied` each document — the paste IS the live state.
+4. `email_sieve_mark_applied` each document, passing the `version` the `put`
+   just returned — the paste IS the live state. Never leave `version` off: it
+   is not defaulted to head, because a later `put` would make head a version
+   the provider has never seen.
 
 ## The editing loop
 
@@ -96,7 +99,13 @@ for drift checks but can never be marked applied.
    of editable area 1 (after require, before the generated blocks)".
    Fastmail validates at save — if it rejects, fix and re-emit; the store
    keeps every attempt.
-4. **Confirm**: only after the user says it's saved, `email_sieve_mark_applied`.
+4. **Confirm**: only after the user says it's saved,
+   `email_sieve_mark_applied` **with the version number you emitted in step 3**
+   — the one `email_sieve_diff` reported as `to`, not "head". A `put` between
+   the emit and the confirmation moves head to a version the provider has never
+   seen, and marking that one is invisible afterwards: every later diff is
+   taken from the applied pointer, so a wrong pointer makes the store agree
+   with itself forever. The tool refuses a call that names no version.
    Never mark applied on your own initiative.
 
 ## Sieve rules for what you write
@@ -124,6 +133,8 @@ for drift checks but can never be marked applied.
 
 `email_sieve_list` shows every document's history state. To roll back:
 `email_sieve_restore` the known-good version, emit it, have the user paste,
-then mark applied. The bad version stays in history for the postmortem.
+then mark applied — naming the version `restore` returned, which is a NEW
+version holding the old content, not the number you restored from. The bad
+version stays in history for the postmortem.
 A document that should never have existed (failed import, wrong name):
 `email_sieve_archive` it — out of sight, never deleted.

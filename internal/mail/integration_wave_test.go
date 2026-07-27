@@ -99,7 +99,7 @@ func runWave(t *testing.T, total int, handles bool, returnIDs string) (spent, or
 		var dryParams mail.MoveParams
 		var dryArgs map[string]any
 		if handles {
-			dryParams = mail.MoveParams{Selection: page.SelectionID, ToMailbox: "Archive", DryRun: true}
+			dryParams = mail.MoveParams{Handle: page.SelectionID, ToMailbox: "Archive", DryRun: true}
 			dryArgs = map[string]any{"selection": page.SelectionID, "toMailbox": "Archive", "dryRun": true}
 		} else {
 			dryParams = mail.MoveParams{IDs: page.IDs, ToMailbox: "Archive", DryRun: true}
@@ -126,7 +126,7 @@ func runWave(t *testing.T, total int, handles bool, returnIDs string) (spent, or
 		if handles {
 			// The receipt replaces the ids AND the phrase: the preview it came
 			// from is the authorization.
-			applyParams = mail.MoveParams{Receipt: dry.ReceiptID}
+			applyParams = mail.MoveParams{Handle: dry.ReceiptID}
 			applyArgs = map[string]any{"receipt": dry.ReceiptID}
 		} else {
 			applyParams = mail.MoveParams{IDs: page.IDs, ToMailbox: "Archive", Confirm: dry.ConfirmPhrase}
@@ -204,14 +204,14 @@ func TestIntegrationQueryStateMovesWithTheCohort(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.Move(ctx, mail.MoveParams{Selection: before.SelectionID, ToMailbox: "Archive", DryRun: true}); err != nil {
+	if _, err := svc.Move(ctx, mail.MoveParams{Handle: before.SelectionID, ToMailbox: "Archive", DryRun: true}); err != nil {
 		t.Fatal(err)
 	}
-	dry, err := svc.Move(ctx, mail.MoveParams{Selection: before.SelectionID, ToMailbox: "Archive", DryRun: true})
+	dry, err := svc.Move(ctx, mail.MoveParams{Handle: before.SelectionID, ToMailbox: "Archive", DryRun: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.Move(ctx, mail.MoveParams{Receipt: dry.ReceiptID}); err != nil {
+	if _, err := svc.Move(ctx, mail.MoveParams{Handle: dry.ReceiptID}); err != nil {
 		t.Fatal(err)
 	}
 	after, err := svc.Search(ctx, mail.SearchParams{Mailbox: "inbox", From: "news@example.test", Fields: []string{"id"}, Limit: 1})

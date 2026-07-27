@@ -43,7 +43,23 @@ type ThreadResult struct {
 	Omitted int            `json:"omitted,omitempty"`
 	Emails  []EmailSummary `json:"emails,omitempty"`
 	Full    []EmailFull    `json:"emailsWithBodies,omitempty"`
+	// SelectionID names EVERY message in the thread — including the ones the
+	// cap omitted from this result. That is safe here in a way it is not for a
+	// grouped scan: Thread/get returns the complete emailIds list regardless of
+	// how many messages are then fetched, so the handle is the whole thread and
+	// not the part that was displayed. Archiving a 150-message thread after
+	// reading the newest 100 of it is therefore one call, and correct.
+	SelectionID string `json:"selectionId,omitempty"`
+	// SelectionNote says so, because "acts on more than you were shown" is
+	// exactly the kind of thing a caller must not have to infer.
+	SelectionNote string `json:"selectionNote,omitempty"`
 }
+
+// threadSelectionNote is used when the display was capped, where the handle
+// covering more than the result is the surprising and useful part.
+const threadSelectionNote = "selectionId names all %d messages in the thread, including the %d not shown here — Thread/get returns the whole list whatever the display cap. Pass it to email_move / email_mark / email_trash to act on the entire thread."
+
+const threadSelectionNoteFull = "selectionId names this thread's messages: pass it to email_move / email_mark / email_trash to act on the whole thread without resending ids."
 
 // GetThread fetches a thread's messages in one batched request, chained with
 // RFC 8620 §3.7 result references:
@@ -189,5 +205,18 @@ func (s *Service) GetThread(ctx context.Context, p ThreadParams) (*ThreadResult,
 		result.Emails = append(result.Emails, e.summaryWith(refs, fields))
 	}
 	result.Returned = len(result.Emails) + len(result.Full)
+	// A thread is a set worth naming, and the tools that consume a handle are
+	// withdrawn at read-only — where the token would be noise in every result.
+	if len(threadIDs) > 0 && s.cfg.AllowOrganize() {
+		result.SelectionID = s.handles.putSelection(&selection{
+			AccountID: accountID,
+			IDs:       append([]string(nil), threadIDs...),
+		})
+		if result.Omitted > 0 {
+			result.SelectionNote = fmt.Sprintf(threadSelectionNote, len(threadIDs), result.Omitted)
+		} else {
+			result.SelectionNote = threadSelectionNoteFull
+		}
+	}
 	return result, nil
 }

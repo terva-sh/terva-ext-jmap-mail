@@ -108,6 +108,36 @@ func configInt(c ext.Config, key string, def int) int {
 	return v
 }
 
+// resolveHandle reads the single `handle` parameter, still accepting the
+// pre-v0.17.0 `selection` and `receipt` names as undocumented aliases.
+//
+// The model re-reads the schema each session, so the aliases are not for it —
+// they are for the wave that is in flight when a deployment lands. A batch
+// that starts refusing halfway through is the most expensive failure this
+// extension has had (TW-027: nineteen rejections, a 2,000-message wave that
+// archived nothing), and a rename is not worth risking it for. Two DIFFERENT
+// values are still refused: silently ranking one alias over another is the
+// ambiguity the single parameter exists to remove.
+func resolveHandle(handle, selection, receipt string) (string, error) {
+	seen := map[string]bool{}
+	var distinct []string
+	for _, v := range []string{handle, selection, receipt} {
+		if v = strings.TrimSpace(v); v != "" && !seen[v] {
+			seen[v] = true
+			distinct = append(distinct, v)
+		}
+	}
+	switch len(distinct) {
+	case 0:
+		return "", nil
+	case 1:
+		return distinct[0], nil
+	default:
+		return "", fmt.Errorf("pass one handle, not %d (%s) — selection and receipt are the former names for handle, and a selectionId (sel_…) or receiptId (rcp_…) goes in handle now",
+			len(distinct), strings.Join(distinct, ", "))
+	}
+}
+
 // service returns a mail.Service for the current config, rebuilding when the
 // config changed (which drops all caches with it).
 func (a *app) service() (*mail.Service, error) {
@@ -541,35 +571,60 @@ func (a *app) handleListMailboxes(raw json.RawMessage) ext.ToolResult {
 	return jsonResult(list)
 }
 
+// filterArgs is the filter half of the argument surface, shared by
+// email_search, email_count and email_group. Embedded rather than restated in
+// each handler so the three cannot drift in what they accept — a caller that
+// has framed a search must be able to count or group the identical set without
+// translating it. filterProperties in main.go is the schema half of the same
+// commitment, and TestFilterSchemaMatchesFilterArgs pins the two together.
+type filterArgs struct {
+	Mailbox         string          `json:"mailbox"`
+	Text            string          `json:"text"`
+	From            string          `json:"from"`
+	To              string          `json:"to"`
+	Cc              string          `json:"cc"`
+	Bcc             string          `json:"bcc"`
+	Subject         string          `json:"subject"`
+	Body            string          `json:"body"`
+	After           string          `json:"after"`
+	Before          string          `json:"before"`
+	HasAttachment   json.RawMessage `json:"hasAttachment"`
+	Keyword         string          `json:"keyword"`
+	NotKeyword      string          `json:"notKeyword"`
+	FilterJSON      json.RawMessage `json:"filterJson"`
+	CollapseThreads bool            `json:"collapseThreads"`
+}
+
+// params converts to the service's parameter type. Only the filter fields are
+// set; the caller fills whatever else its own tool takes.
+func (f filterArgs) params() (mail.SearchParams, error) {
+	hasAttachment, err := parseHasAttachment(f.HasAttachment)
+	if err != nil {
+		return mail.SearchParams{}, err
+	}
+	return mail.SearchParams{
+		Mailbox: f.Mailbox, Text: f.Text, From: f.From, To: f.To, Cc: f.Cc, Bcc: f.Bcc,
+		Subject: f.Subject, Body: f.Body, After: f.After, Before: f.Before,
+		HasAttachment: hasAttachment, Keyword: f.Keyword, NotKeyword: f.NotKeyword,
+		FilterJSON: f.FilterJSON, CollapseThreads: f.CollapseThreads,
+	}, nil
+}
+
 func (a *app) handleSearch(raw json.RawMessage) ext.ToolResult {
 	var in struct {
-		AccountID       string          `json:"accountId"`
-		Mailbox         string          `json:"mailbox"`
-		Text            string          `json:"text"`
-		From            string          `json:"from"`
-		To              string          `json:"to"`
-		Cc              string          `json:"cc"`
-		Bcc             string          `json:"bcc"`
-		Subject         string          `json:"subject"`
-		Body            string          `json:"body"`
-		After           string          `json:"after"`
-		Before          string          `json:"before"`
-		HasAttachment   json.RawMessage `json:"hasAttachment"`
-		Keyword         string          `json:"keyword"`
-		NotKeyword      string          `json:"notKeyword"`
-		FilterJSON      json.RawMessage `json:"filterJson"`
-		CollapseThreads bool            `json:"collapseThreads"`
-		IncludeTotal    bool            `json:"includeTotal"`
-		Fields          []string        `json:"fields"`
-		ReturnIDs       string          `json:"returnIds"`
-		Limit           int             `json:"limit"`
-		Position        int             `json:"position"`
-		Sort            string          `json:"sort"`
+		AccountID string `json:"accountId"`
+		filterArgs
+		IncludeTotal bool     `json:"includeTotal"`
+		Fields       []string `json:"fields"`
+		ReturnIDs    string   `json:"returnIds"`
+		Limit        int      `json:"limit"`
+		Position     int      `json:"position"`
+		Sort         string   `json:"sort"`
 	}
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return ext.TextErrorResult("invalid args: " + err.Error())
 	}
-	hasAttachment, err := parseHasAttachment(in.HasAttachment)
+	params, err := in.filterArgs.params()
 	if err != nil {
 		return ext.TextErrorResult(err.Error())
 	}
@@ -579,14 +634,85 @@ func (a *app) handleSearch(raw json.RawMessage) ext.ToolResult {
 	}
 	ctx, cancel := toolCtx()
 	defer cancel()
-	result, err := svc.Search(ctx, mail.SearchParams{
-		Account: in.AccountID, Mailbox: in.Mailbox,
-		Text: in.Text, From: in.From, To: in.To, Cc: in.Cc, Bcc: in.Bcc,
-		Subject: in.Subject, Body: in.Body, After: in.After, Before: in.Before,
-		HasAttachment: hasAttachment, Keyword: in.Keyword, NotKeyword: in.NotKeyword,
-		FilterJSON: in.FilterJSON, CollapseThreads: in.CollapseThreads, IncludeTotal: in.IncludeTotal,
-		Fields: in.Fields, ReturnIDs: in.ReturnIDs,
-		Limit: in.Limit, Position: in.Position, Sort: in.Sort,
+	params.Account = in.AccountID
+	params.IncludeTotal = in.IncludeTotal
+	params.Fields = in.Fields
+	params.ReturnIDs = in.ReturnIDs
+	params.Limit = in.Limit
+	params.Position = in.Position
+	params.Sort = in.Sort
+	result, err := svc.Search(ctx, params)
+	if err != nil {
+		return ext.TextErrorResult(err.Error())
+	}
+	return jsonResult(result)
+}
+
+func (a *app) handleCount(raw json.RawMessage) ext.ToolResult {
+	var in struct {
+		AccountID string `json:"accountId"`
+		Queries   []struct {
+			Label  string     `json:"label"`
+			Filter filterArgs `json:"filter"`
+		} `json:"queries"`
+	}
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return ext.TextErrorResult("invalid args: " + err.Error())
+	}
+	queries := make([]mail.CountQuery, 0, len(in.Queries))
+	for i, q := range in.Queries {
+		params, err := q.Filter.params()
+		if err != nil {
+			return ext.TextErrorResult(fmt.Sprintf("query %d (%q): %v", i+1, q.Label, err))
+		}
+		queries = append(queries, mail.CountQuery{Label: q.Label, Filter: params})
+	}
+	svc, err := a.service()
+	if err != nil {
+		return ext.TextErrorResult(err.Error())
+	}
+	ctx, cancel := toolCtx()
+	defer cancel()
+	result, err := svc.Count(ctx, mail.CountParams{Account: in.AccountID, Queries: queries})
+	if err != nil {
+		return ext.TextErrorResult(err.Error())
+	}
+	return jsonResult(result)
+}
+
+func (a *app) handleGroup(raw json.RawMessage) ext.ToolResult {
+	var in struct {
+		AccountID string `json:"accountId"`
+		filterArgs
+		Handle      string `json:"handle"`
+		Selection   string `json:"selection"`
+		Receipt     string `json:"receipt"`
+		GroupBy     string `json:"groupBy"`
+		Interval    string `json:"interval"`
+		GroupLimit  int    `json:"groupLimit"`
+		MaxMessages int    `json:"maxMessages"`
+	}
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return ext.TextErrorResult("invalid args: " + err.Error())
+	}
+	params, err := in.filterArgs.params()
+	if err != nil {
+		return ext.TextErrorResult(err.Error())
+	}
+	svc, err := a.service()
+	if err != nil {
+		return ext.TextErrorResult(err.Error())
+	}
+	ctx, cancel := toolCtx()
+	defer cancel()
+	handle, err := resolveHandle(in.Handle, in.Selection, in.Receipt)
+	if err != nil {
+		return ext.TextErrorResult(err.Error())
+	}
+	result, err := svc.Group(ctx, mail.GroupParams{
+		Account: in.AccountID, Filter: params, Handle: handle,
+		GroupBy: in.GroupBy, Interval: in.Interval,
+		GroupLimit: in.GroupLimit, MaxMessages: in.MaxMessages,
 	})
 	if err != nil {
 		return ext.TextErrorResult(err.Error())
@@ -633,6 +759,10 @@ func (a *app) handleGet(raw json.RawMessage) ext.ToolResult {
 	var in struct {
 		AccountID       string   `json:"accountId"`
 		IDs             []string `json:"ids"`
+		Handle          string   `json:"handle"`
+		Selection       string   `json:"selection"`
+		Receipt         string   `json:"receipt"`
+		SelectionOffset int      `json:"selectionOffset"`
 		Fields          []string `json:"fields"`
 		BodyFormat      string   `json:"bodyFormat"`
 		MaxBodyBytes    int      `json:"maxBodyBytes"`
@@ -641,6 +771,10 @@ func (a *app) handleGet(raw json.RawMessage) ext.ToolResult {
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return ext.TextErrorResult("invalid args: " + err.Error())
 	}
+	handle, err := resolveHandle(in.Handle, in.Selection, in.Receipt)
+	if err != nil {
+		return ext.TextErrorResult(err.Error())
+	}
 	svc, err := a.service()
 	if err != nil {
 		return ext.TextErrorResult(err.Error())
@@ -648,7 +782,9 @@ func (a *app) handleGet(raw json.RawMessage) ext.ToolResult {
 	ctx, cancel := toolCtx()
 	defer cancel()
 	result, err := svc.Get(ctx, mail.GetParams{
-		Account: in.AccountID, IDs: in.IDs, Fields: in.Fields, BodyFormat: in.BodyFormat,
+		Account: in.AccountID, IDs: in.IDs,
+		Handle: handle, SelectionOffset: in.SelectionOffset,
+		Fields: in.Fields, BodyFormat: in.BodyFormat,
 		MaxBodyBytes: in.MaxBodyBytes, IncludeFullUrls: in.IncludeFullUrls,
 	})
 	if err != nil {
@@ -664,9 +800,10 @@ func (a *app) handleMark(raw json.RawMessage) ext.ToolResult {
 	var in struct {
 		AccountID       string   `json:"accountId"`
 		IDs             []string `json:"ids"`
-		Selection       string   `json:"selection"`
+		Handle          string   `json:"handle"`
+		Selection       string   `json:"selection"` // former name for handle
+		Receipt         string   `json:"receipt"`   // former name for handle
 		SelectionOffset int      `json:"selectionOffset"`
-		Receipt         string   `json:"receipt"`
 		Action          string   `json:"action"`
 		DryRun          bool     `json:"dryRun"`
 		Confirm         string   `json:"confirm"`
@@ -674,6 +811,10 @@ func (a *app) handleMark(raw json.RawMessage) ext.ToolResult {
 	}
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return ext.TextErrorResult("invalid args: " + err.Error())
+	}
+	handle, err := resolveHandle(in.Handle, in.Selection, in.Receipt)
+	if err != nil {
+		return ext.TextErrorResult(err.Error())
 	}
 	svc, err := a.service()
 	if err != nil {
@@ -683,7 +824,7 @@ func (a *app) handleMark(raw json.RawMessage) ext.ToolResult {
 	defer cancel()
 	result, err := svc.Mark(ctx, mail.MarkParams{
 		Account: in.AccountID, IDs: in.IDs, Action: in.Action, DryRun: in.DryRun, Confirm: in.Confirm,
-		Selection: in.Selection, SelectionOffset: in.SelectionOffset, Receipt: in.Receipt,
+		Handle: handle, SelectionOffset: in.SelectionOffset,
 		Verbose: in.Verbose,
 	})
 	if err != nil {
@@ -699,9 +840,10 @@ func (a *app) handleMove(raw json.RawMessage) ext.ToolResult {
 	var in struct {
 		AccountID       string   `json:"accountId"`
 		IDs             []string `json:"ids"`
-		Selection       string   `json:"selection"`
+		Handle          string   `json:"handle"`
+		Selection       string   `json:"selection"` // former name for handle
+		Receipt         string   `json:"receipt"`   // former name for handle
 		SelectionOffset int      `json:"selectionOffset"`
-		Receipt         string   `json:"receipt"`
 		ToMailbox       string   `json:"toMailbox"`
 		KeepInMailboxes bool     `json:"keepInMailboxes"`
 		DryRun          bool     `json:"dryRun"`
@@ -711,6 +853,10 @@ func (a *app) handleMove(raw json.RawMessage) ext.ToolResult {
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return ext.TextErrorResult("invalid args: " + err.Error())
 	}
+	handle, err := resolveHandle(in.Handle, in.Selection, in.Receipt)
+	if err != nil {
+		return ext.TextErrorResult(err.Error())
+	}
 	svc, err := a.service()
 	if err != nil {
 		return ext.TextErrorResult(err.Error())
@@ -719,7 +865,7 @@ func (a *app) handleMove(raw json.RawMessage) ext.ToolResult {
 	defer cancel()
 	result, err := svc.Move(ctx, mail.MoveParams{
 		Account: in.AccountID, IDs: in.IDs, ToMailbox: in.ToMailbox,
-		Selection: in.Selection, SelectionOffset: in.SelectionOffset, Receipt: in.Receipt,
+		Handle: handle, SelectionOffset: in.SelectionOffset,
 		KeepInMailboxes: in.KeepInMailboxes, DryRun: in.DryRun, Confirm: in.Confirm,
 		Verbose: in.Verbose,
 	})
@@ -736,15 +882,20 @@ func (a *app) handleTrash(raw json.RawMessage) ext.ToolResult {
 	var in struct {
 		AccountID       string   `json:"accountId"`
 		IDs             []string `json:"ids"`
-		Selection       string   `json:"selection"`
+		Handle          string   `json:"handle"`
+		Selection       string   `json:"selection"` // former name for handle
+		Receipt         string   `json:"receipt"`   // former name for handle
 		SelectionOffset int      `json:"selectionOffset"`
-		Receipt         string   `json:"receipt"`
 		DryRun          bool     `json:"dryRun"`
 		Confirm         string   `json:"confirm"`
 		Verbose         *bool    `json:"verbose"`
 	}
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return ext.TextErrorResult("invalid args: " + err.Error())
+	}
+	handle, err := resolveHandle(in.Handle, in.Selection, in.Receipt)
+	if err != nil {
+		return ext.TextErrorResult(err.Error())
 	}
 	svc, err := a.service()
 	if err != nil {
@@ -754,7 +905,7 @@ func (a *app) handleTrash(raw json.RawMessage) ext.ToolResult {
 	defer cancel()
 	result, err := svc.Trash(ctx, mail.TrashParams{
 		Account: in.AccountID, IDs: in.IDs, DryRun: in.DryRun, Confirm: in.Confirm,
-		Selection: in.Selection, SelectionOffset: in.SelectionOffset, Receipt: in.Receipt,
+		Handle: handle, SelectionOffset: in.SelectionOffset,
 		Verbose: in.Verbose,
 	})
 	if err != nil {
@@ -773,12 +924,20 @@ func (a *app) handleDestroy(raw json.RawMessage) ext.ToolResult {
 	var in struct {
 		AccountID       string   `json:"accountId"`
 		IDs             []string `json:"ids"`
+		Handle          string   `json:"handle"`
+		Selection       string   `json:"selection"`
+		Receipt         string   `json:"receipt"`
+		SelectionOffset int      `json:"selectionOffset"`
 		AllowNotInTrash bool     `json:"allowNotInTrash"`
 		DryRun          bool     `json:"dryRun"`
 		Confirm         string   `json:"confirm"`
 	}
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return ext.TextErrorResult("invalid args: " + err.Error())
+	}
+	handle, err := resolveHandle(in.Handle, in.Selection, in.Receipt)
+	if err != nil {
+		return ext.TextErrorResult(err.Error())
 	}
 	svc, err := a.service()
 	if err != nil {
@@ -787,8 +946,10 @@ func (a *app) handleDestroy(raw json.RawMessage) ext.ToolResult {
 	ctx, cancel := toolCtx()
 	defer cancel()
 	result, err := svc.Destroy(ctx, mail.DestroyParams{
-		Account: in.AccountID, IDs: in.IDs, AllowNotInTrash: in.AllowNotInTrash,
-		DryRun: in.DryRun, Confirm: in.Confirm,
+		Account: in.AccountID, IDs: in.IDs,
+		Handle: handle, SelectionOffset: in.SelectionOffset,
+		AllowNotInTrash: in.AllowNotInTrash,
+		DryRun:          in.DryRun, Confirm: in.Confirm,
 	})
 	if err != nil {
 		return ext.TextErrorResult(err.Error())

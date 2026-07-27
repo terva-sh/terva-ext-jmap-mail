@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 
 	"terva-ext-jmap-mail/internal/version"
 
@@ -45,6 +46,12 @@ func main() {
 	e.Tool("email_list_accounts", descAccounts, emptySchema(), a.audited("email_list_accounts", authNetRead, a.handleListAccounts), netRead)
 	e.Tool("email_list_mailboxes", descMailboxes, schemaMailboxes(), a.audited("email_list_mailboxes", authNetRead, a.handleListMailboxes), netRead)
 	e.Tool("email_search", descSearch, schemaSearch(), a.audited("email_search", authNetRead, a.handleSearch), netRead)
+	// The two aggregates. Both answer a question email_search structurally
+	// cannot — one number per call is not a table, and one filter per call is
+	// not a distribution — and both return counts only, so the mail they
+	// summarize never enters the transcript at all.
+	e.Tool("email_count", descCount, schemaCount(), a.audited("email_count", authNetRead, a.handleCount), netRead)
+	e.Tool("email_group", descGroup, schemaGroup(), a.audited("email_group", authNetRead, a.handleGroup), netRead)
 	e.Tool("email_get", descGet, schemaGet(), a.audited("email_get", authNetRead, a.handleGet), netRead)
 	e.Tool("email_get_thread", descThread, schemaThread(), a.audited("email_get_thread", authNetRead, a.handleGetThread), netRead)
 
@@ -122,15 +129,26 @@ const contextPolicy = "The email_* tools read and organize the user's mailboxes 
 	// measured as most of a bulk session's output tokens and most of its
 	// wall-clock; handles exist so the model never has to, and the model only
 	// reaches for them if it is told to here.
-	"NEVER retype a list of ids you were just given. Every search result carries a selectionId; pass it as " +
-	"selection to email_move / email_mark / email_trash. Every dry run returns a receiptId; pass THAT to the " +
-	"real run, which then needs no ids and no confirm phrase. So a batch is: email_search fields:[\"id\"] → " +
-	"email_move selection:<selectionId> dryRun:true → email_move receipt:<receiptId>. Those three ways of naming " +
-	"a set are alternatives: send exactly one, and if you fill in every field by habit, the inert value for the " +
-	"others is [] for ids and \"\" for selection and receipt — never a placeholder id, which reads as a real one. " +
-	"A selection larger than " +
-	"200 is consumed 200 at a time via selectionOffset, and the result's selection.remaining says whether to " +
-	"come back — one 500-id search covers three batches. A receipt applies exactly the set its dry run " +
+	"NEVER retype a list of ids you were just given. Every search result carries a selectionId (sel_...); pass it " +
+	"as handle to email_move / email_mark / email_trash / email_destroy. Every dry run returns a receiptId (rcp_...); pass THAT as " +
+	"handle to the real run, which then needs no ids and no confirm phrase. So a batch is: email_search " +
+	"fields:[\"id\"] → email_move handle:<selectionId> dryRun:true → email_move handle:<receiptId>. The prefix says " +
+	"which kind a handle is, so the call states which protocol it is using. handle and ids are alternatives: send " +
+	"one, and if you fill in every field by habit, the inert value for the other is [] for ids and \"\" for handle " +
+	"— never a placeholder id, which reads as a real one. " +
+	"For a backlog, page big and suppress the ids: email_search fields:[\"id\"] returnIds:\"none\" limit:2000 returns " +
+	"one selectionId and no array, and that whole page is ONE dry run and ONE apply — 2,000 messages for three calls, " +
+	"not thirty. A selection larger than 2000 is consumed 2000 at a time via selectionOffset, and the result's " +
+	"selection.remaining says whether to come back. If a bulk call stops part-way it says so (aborted, appliedTo) and " +
+	"returns remainingSelectionId naming the untouched messages — dry-run and apply THAT, rather than re-running the " +
+	"original set and redoing work that already landed. " +
+	// A failed id is not an answer; a handle over the failures is, because it
+	// feeds the two tools that answer "which ones" and "try again".
+	"When a bulk run reports failures they come back GROUPED BY CAUSE, each group carrying a selectionId rather " +
+	"than a list of ids. Use it: email_get handle:<that id> shows which messages failed (with subjects — an id " +
+	"identifies nothing to the user), and passing it back to the same organize tool retries exactly those. Causes " +
+	"are separate handles on purpose; retrying a notFound group will always fail, because those messages are gone. " +
+	"A receipt applies exactly the set its dry run " +
 	"previewed, so the preview and the change cannot disagree about which messages; if a call's result is lost, " +
 	"re-present the receipt rather than redoing the work, and it replays the original outcome instead of acting " +
 	"twice. When organizing a backlog page by page, pick ONE discipline: if the change removes messages " +
@@ -154,13 +172,23 @@ const contextPolicy = "The email_* tools read and organize the user's mailboxes 
 	"email_move, email_trash) support dryRun — preview before bulk changes; runs over 20 messages " +
 	"require the exact confirm phrase given in the refusal. email_trash moves mail to the Trash " +
 	"mailbox and is recoverable. email_destroy is PERMANENT and unrecoverable: restricted to mail " +
-	"already in Trash by default, and every run needs the exact confirm phrase a dryRun returns — " +
-	"always dryRun first. Which tools are offered follows the user's configured access_level " +
+	"already in Trash by default, and every run needs authorization — always dryRun first, then present " +
+	"the receiptId it returns as handle. Prefer that over the confirm phrase it returns beside it: the " +
+	"receipt covers exactly the messages the preview cleared, while the phrase covers every id you named " +
+	"including any the Trash gate held back. Unlike the recoverable tools, a message that moved since the " +
+	"preview aborts the run rather than being destroyed anyway — re-preview and decide again. " +
+	"Which tools are offered follows the user's configured access_level " +
 	"(read-only / read-organize / read-organize-destroy); only the user can raise it, in /extensions. " +
 	"There is no send capability. " +
 	"The email_sieve_* tools (an opt-in via enable_sieve_tools) keep a LOCAL append-only versioned store " +
 	"of the user's sieve filter documents (head/applied pointers, diffs, lossless restore); they never " +
-	"contact the provider — follow the sieve-rules skill for the paste-in → edit → emit → confirm workflow."
+	"contact the provider — follow the sieve-rules skill for the paste-in → edit → emit → confirm workflow. " +
+	// The confirm step is separated from the emit step by a human pasting
+	// into a web UI, so "head" at confirm time is not what was reviewed.
+	"When confirming, pass email_sieve_mark_applied the VERSION NUMBER you emitted, which the diff or get reported — " +
+	"never leave it to default, and never assume head: a put in between moves head to something the provider has " +
+	"never seen, and since every later diff is taken from the applied pointer, marking the wrong one leaves a store " +
+	"that agrees with itself and is wrong."
 
 const (
 	descStatus = "Check JMAP mail configuration: chosen account, provider capabilities, server limits, " +
@@ -180,22 +208,45 @@ const (
 		"Results carry a selectionId naming the ids: pass it to email_move / email_mark / email_trash as selection instead of retyping them — " +
 		"and returnIds:\"none\" then drops the id array entirely, since the handle already names the set (returnIds:\"boundaries\" keeps just the first and last, for checking placement afterwards)."
 
-	descGet = "Fetch up to 20 emails by id. fields projects the result down to the properties you need — [\"mailboxes\",\"keywords\"] to check where messages landed, " +
+	descCount = "Count several filters at once — one request, one server state, so the rows of a table actually sum. " +
+		"Each query is {label, filter} with email_search's filter surface; the result is [{label, total}] plus the single " +
+		"queryState they were all measured against. Use this for any set of numbers that must reconcile (age buckets, " +
+		"read vs unread, per-mailbox splits) instead of one email_search per row: separate searches each get their own " +
+		"moment, so a message arriving mid-survey lands in one row and not the total. No message is fetched, no page size " +
+		"is involved, and no selectionId is minted."
+
+	descGroup = "Get a mailbox's distribution as numbers, in one call — who is sending, or how old the backlog is. " +
+		"groupBy:\"from\" ranks senders; groupBy:\"receivedAt\" with an interval gives an age histogram. Returns " +
+		"[{key, total, unread, newest, oldest}] ranked biggest-first, and NOTHING else about the messages: no subjects, " +
+		"no previews, no ids, no display names. Each group carries a selectionId naming exactly its messages, so acting on a " +
+		"row (\"archive everything from the top sender\") is the next call rather than another search — absent when the scan " +
+		"was truncated, because a handle over a window would name part of a group while reading as all of it. This replaces the survey pattern of dumping a few hundred message summaries " +
+		"to eyeball frequent senders and then issuing a counter per guess — that samples the ends of a mailbox, misses steady " +
+		"mid-volume senders entirely, and leaves the summaries in context for the rest of the session. The result always states " +
+		"matched and scanned, so a ranking taken over a bounded window is visibly one."
+
+	descGet = "Fetch up to 20 emails by id, or by handle — any sel_/rcp_ id, including the selectionId on a " +
+		"mutating result's failure group, which is how you see WHICH messages failed without their ids ever " +
+		"crossing into the transcript. A handle larger than 20 is read in slices (selectionOffset; " +
+		"selection.remaining says whether to come back), because this cap bounds the bodies coming back rather " +
+		"than the ids going out. " +
+		"fields projects the result down to the properties you need — [\"mailboxes\",\"keywords\"] to check where messages landed, " +
 		"with no sender, subject or preview text returned at all; name bodyText or bodyHtml to include a body, or pass no fields and let bodyFormat " +
 		"(text, html, both, metadata) decide as before. Bodies are bounded and results report truncation. URL query strings and token-like segments in bodies are redacted by default " +
 		"(redactedUrls counts them) — pass includeFullUrls only when the task needs a working link."
 
 	descThread = "Fetch a thread's messages, by threadId or any member email id. " +
+		"The result carries a selectionId naming EVERY message in the thread — including any the display cap omitted, " +
+		"since the thread's full id list comes back regardless — so acting on the whole thread is one further call. " +
 		"Summaries by default; includeBodies adds bounded text bodies (URLs redacted like email_get; includeFullUrls opts out). " +
 		"Bounded to the newest 100 messages (20 with bodies) — count is the thread's real size and omitted says how many " +
 		"older ones were left out; limit asks for fewer."
 
 	// The three organize tools share a naming rule; state it identically in
 	// each description so a model reading only one of them still gets it.
-	descTargets = "Name the messages ONE of three ways: ids, selection (a selectionId from email_search), or " +
-		"receipt (a receiptId from this tool's own dry run). Prefer selection over retyping ids, and receipt over both — " +
-		"a receipt applies exactly the previewed set, needs no confirm phrase, and re-presenting one whose result you lost " +
-		"returns the original outcome instead of acting twice. "
+	descTargets = "Name the messages with handle (a sel_ selectionId from email_search, or a rcp_ receiptId from this " +
+		"tool's own dry run) or with ids. Prefer a handle: it is the same set without retyping it, and a receipt " +
+		"additionally replaces the confirm phrase and cannot act on different messages than its preview showed. "
 
 	descMark = "Mark emails read/unread or flagged/unflagged. " + descTargets +
 		"Supports dryRun; more than 20 ids requires confirm " +
@@ -214,9 +265,13 @@ const (
 		"message unless verbose:true."
 
 	descDestroy = "PERMANENTLY destroy emails — unrecoverable; email_trash is the recoverable alternative. " +
-		"Targets must already be in Trash (unless allowNotInTrash). Every run requires the exact confirm " +
-		"phrase; dryRun previews the outcome and returns it. The phrase is bound to the exact id batch " +
-		"and options — any change means a fresh dryRun."
+		"Targets must already be in Trash (unless allowNotInTrash). " + descTargets +
+		"Every run needs authorization: dryRun previews the outcome and returns BOTH a receiptId and the exact " +
+		"confirm phrase, and a real run presents one of them. Prefer the receipt — it covers exactly the messages " +
+		"the preview said would go (never the ones the Trash gate held back, which the phrase does cover and would " +
+		"be refused on), and re-presenting it after a lost result reports the original outcome instead of destroying " +
+		"again. Unlike the recoverable tools, a message that has moved since the preview aborts the whole run rather " +
+		"than being destroyed anyway."
 
 	descSieveList = "List locally stored sieve filter documents: head/applied versions, origins, pending changes, context-only/archived flags. Local only."
 
@@ -231,7 +286,9 @@ const (
 
 	descSieveRestore = "Restore an earlier version of a sieve document by appending a copy of it as the new head. Nothing is discarded. Local only."
 
-	descSieveMarkApplied = "Record that a version (default: head) is now live at the provider, after the user confirms pasting it. " +
+	descSieveMarkApplied = "Record that a specific version is now live at the provider, after the user confirms pasting it. " +
+		"version is required and is NOT head by default — pass the number email_sieve_diff or email_sieve_get showed you, " +
+		"because a put between the review and the confirmation moves head without anything reaching the provider. " +
 		"Refuses context-only documents and truncation-suspect content (force overrides the latter). Local only."
 
 	descSieveArchive = "Move a sieve document out of (or back into, with unarchive) the working set. " +
@@ -258,8 +315,12 @@ const (
 //     false is a filter excluding every message that has an attachment,
 //     applied silently, with nothing in the result to notice it by.
 //
-// A genuinely required parameter (email_destroy's ids, email_get's ids) is the
-// exception to the first two: there is nothing for the inert value to mean.
+// Nothing declares required:["ids"] any more. Both tools that did — first
+// email_destroy, then email_get — stopped the moment a handle could name the
+// set instead: required plus minItems:1 makes the inert empty array
+// schema-invalid on exactly the calls using the safer selector, and even
+// without minItems it forces a handle-only call to pad a key it is not using
+// and turns omitting it into a validation failure the model never reads.
 // The authority strings an audit record carries. They mirror the
 // ext.Authority* constants the same tool is registered with; a record that
 // claimed a weaker authority than the tool actually holds would be worse than
@@ -287,11 +348,14 @@ func schemaMailboxes() json.RawMessage {
 }`)
 }
 
-func schemaSearch() json.RawMessage {
-	return json.RawMessage(`{
-  "type": "object",
-  "properties": {
-    "accountId": {"type": "string", "description": "Account id or name; empty for the default account."},
+// filterProperties is the RFC 8621 §4.4.1 filter surface, shared verbatim by
+// email_search, email_count and email_group. Kept in one string for the same
+// reason targetProperties is: three tools that filter the same mail must
+// filter it the same way, and a caller that has framed a search should be able
+// to count or group the identical set without translating it into a second
+// dialect. collapseThreads rides along because it changes what "one message"
+// means, and therefore changes every count taken over the filter.
+const filterProperties = `
     "mailbox": {"type": "string", "description": "Restrict to one mailbox: role (inbox, trash, ...), path (Inbox/Gaming), display name, or id."},
     "text": {"type": "string", "description": "Match anywhere: from/to/cc/bcc, subject, body."},
     "from": {"type": "string"},
@@ -306,13 +370,59 @@ func schemaSearch() json.RawMessage {
     "keyword": {"type": "string", "description": "Require a JMAP keyword, e.g. $seen or $flagged."},
     "notKeyword": {"type": "string", "description": "Exclude a JMAP keyword, e.g. $seen for unread."},
     "filterJson": {"type": "object", "additionalProperties": true, "description": "Raw RFC 8621 Email/query filter (FilterCondition or AND/OR/NOT FilterOperator), e.g. from a Fastmail jmapquery block. Replaces the structured filter params; only mailbox may combine (ANDed in)."},
-    "collapseThreads": {"type": "boolean", "default": false, "description": "At most one result per thread."},
+    "collapseThreads": {"type": "boolean", "default": false, "description": "At most one result per thread."},`
+
+func schemaSearch() json.RawMessage {
+	return json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "accountId": {"type": "string", "description": "Account id or name; empty for the default account."},` + filterProperties + `
     "includeTotal": {"type": "boolean", "default": false, "description": "Also return the exact total match count (may cost the server extra work)."},
     "fields": {"type": "array", "items": {"type": "string", "enum": ["", "id", "threadId", "mailboxes", "keywords", "from", "to", "subject", "receivedAt", "sentAt", "hasAttachment", "size", "preview"]}, "description": "Return only these summary properties (id is always included); empty = all of them. Use [\"id\"] for bulk organization — it skips the per-message fetch entirely and returns a flat ids array, by far the cheapest result shape."},
     "returnIds": {"type": "string", "enum": ["", "all", "none", "boundaries"], "default": "", "description": "Which matched ids to return. all (the default, and what \"\" means) as today; none returns only the counts, queryState and selectionId — the handle names the set, so on the bulk path the array is redundant with the field that replaced it; boundaries adds firstId and lastId for proving afterwards where a batch began and ended. none and boundaries make fields irrelevant: no per-message property is returned either way."},
-    "limit": {"type": "integer", "minimum": 0, "maximum": 500, "default": 20, "description": "Page size; 0 (or omitted) means the default of 20. Above 100 requires a fields projection that omits preview; otherwise it is clamped to 100 (the applied value comes back as limit). One 500-id page feeds three mutating calls via selectionId + selectionOffset."},
+    "limit": {"type": "integer", "minimum": 0, "maximum": 2000, "default": 20, "description": "Page size; 0 (or omitted) means the default of 20. Above 100 requires a fields projection that omits preview (else clamped to 100); above 500 requires returnIds \"none\" or \"boundaries\", which is what makes a big page free — nothing per-message comes back, so a 2000-id page reaches you as one selectionId. The applied value always comes back as limit. A 2000-id page is ONE email_move / email_mark / email_trash call, so a backlog costs one search, one dry run and one apply per 2000 messages."},
     "position": {"type": "integer", "minimum": 0, "default": 0, "description": "Offset for paging."},
     "sort": {"type": "string", "enum": ["", "newest", "oldest"], "default": "newest", "description": "Order by receivedAt; \"\" means newest."}
+  }
+}`)
+}
+
+func schemaCount() json.RawMessage {
+	return json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "accountId": {"type": "string", "description": "Account id or name; empty for the default account."},
+    "queries": {
+      "type": "array",
+      "maxItems": 15,
+      "description": "The rows of your table. Every row is counted in ONE request against ONE server state, which is what makes them sum. Counting the same rows with separate email_search calls does not: each gets its own moment, so a message arriving mid-survey lands in one row and not the total, and nothing says so.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "label": {"type": "string", "description": "Your name for this row — required, and echoed back on it. The tool cannot invent one, because the label is how a number is matched to the question that produced it."},
+          "filter": {
+            "type": "object",
+            "description": "What to count. Same filter surface as email_search; a row naming nothing at all is treated as padding and dropped rather than counted as the whole account.",
+            "properties": {` + strings.TrimSuffix(filterProperties, ",") + `
+            }
+          }
+        }
+      }
+    }
+  }
+}`)
+}
+
+func schemaGroup() json.RawMessage {
+	return json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "accountId": {"type": "string", "description": "Account id or name; empty for the default account."},` + filterProperties + `
+    "handle": {"type": "string", "description": "Group the messages a handle names instead of running a query: any sel_ or rcp_ id, including the selectionId on a failure group — \"are my 400 failures all one sender?\" is a question about a set no filter can express, since JMAP has no id condition. Mutually exclusive with the filter fields; \"\" means \"not this way\"."},
+    "groupBy": {"type": "string", "enum": ["", "from", "receivedAt"], "description": "The distribution to compute. from ranks senders; receivedAt buckets by age. Required — \"\" is accepted by the schema only so the refusal comes from the tool, naming the two choices, rather than from schema validation."},
+    "interval": {"type": "string", "enum": ["", "month", "week", "day"], "default": "", "description": "Bucket width for groupBy:\"receivedAt\"; \"\" means month. Ignored for from."},
+    "groupLimit": {"type": "integer", "minimum": 0, "maximum": 200, "default": 25, "description": "How many ranked rows to return; 0 (or omitted) means 25. Rows past the limit are not listed but are still counted, in distinctKeys and otherTotal."},
+    "maxMessages": {"type": "integer", "minimum": 0, "maximum": 20000, "default": 5000, "description": "Upper bound on messages aggregated; 0 (or omitted) means 5000. If the filter matches more, the newest maxMessages are used and the result says so (truncated, with matched and scanned) — a ranking over a window is not a ranking over the mailbox, and the result never lets that pass unmarked."}
   }
 }`)
 }
@@ -322,34 +432,40 @@ func schemaGet() json.RawMessage {
   "type": "object",
   "properties": {
     "accountId": {"type": "string", "description": "Account id or name; empty for the default account."},
-    "ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 20},
+    "ids": {"type": "array", "items": {"type": "string"}, "maxItems": 20, "description": "Explicit message ids, at most 20. [] means \"not this way\" and is the same as omitting it."},
+    "handle": {"type": "string", "description": "Read the messages a handle names instead of listing ids: any sel_ or rcp_ id, INCLUDING the selectionId on a failure group or the remainingSelectionId of a partial run — that is how you see which messages failed without ever holding their ids. Unlike the organize tools, the 20-message cap still applies: theirs bounds the ids you send, this one bounds the subjects and bodies coming back, which a handle does not shrink. A larger handle is read in slices via selectionOffset, and selection.remaining says whether to come back. \"\" means \"not this way\"."},
+    "selectionOffset": {"type": "integer", "minimum": 0, "default": 0, "description": "Where in the handle to start reading; ignored when ids are given."},
     "fields": {"type": "array", "items": {"type": "string", "enum": ["", "id", "threadId", "mailboxes", "keywords", "from", "to", "subject", "receivedAt", "sentAt", "hasAttachment", "size", "preview", "cc", "bcc", "replyTo", "attachments", "bodyText", "bodyHtml"]}, "description": "Return only these properties (id is always included); empty = all of them, as today. This is the whole answer to what you want back, bodies included — name bodyText or bodyHtml to get one, and a projection naming neither returns metadata only whatever bodyFormat says. Checking where messages landed is [\"mailboxes\",\"keywords\"], which returns no sender, subject or preview text at all. Every email_search projection is valid here."},
     "bodyFormat": {"type": "string", "enum": ["", "text", "html", "both", "metadata"], "default": "text", "description": "Shorthand for callers passing no fields: which bodies to fetch (\"\" means text). Ignored when fields is set."},
     "maxBodyBytes": {"type": "integer", "minimum": 0, "description": "Per-message body byte budget; capped by the configured maximum. 0 (or omitted) means the configured default."},
     "includeFullUrls": {"type": "boolean", "default": false, "description": "Keep URLs intact (query strings, tokens). Default strips them — use only when the user needs a working link."}
-  },
-  "required": ["ids"]
+  }
 }`)
 }
 
-// targetProperties are the three mutually exclusive ways every organize tool
+// targetProperties are the two mutually exclusive ways every organize tool
 // lets a caller name its messages. Kept in one string so the three schemas
-// cannot drift, and so the "exactly one of these" rule is stated identically
-// wherever the model reads it.
+// cannot drift, and so the rule is stated identically wherever the model
+// reads it.
 //
-// Every one of them must have a representable "not this one" value, and the
-// schema must permit it. Models routinely pad every declared property rather
-// than omitting keys: "" is inert for selection and receipt, and 0 is inert for
-// selectionOffset, but `ids` shipped with minItems:1 in v0.13.0 — so the empty
-// array that means "not naming ids this way" was schema-invalid, and a padding
-// model substituted ["placeholder"], which is indistinguishable from a real
-// answer. Every selection-based call was then refused as naming two selectors.
-// Hence no minItems here. maxItems stays: it is a real bound, not a floor.
+// There used to be three — ids, selection, receipt — and a call did not state
+// its own mode: a reader worked it out by testing three fields for emptiness.
+// One `handle` carries both kinds now, and the sel_/rcp_ prefix says which, so
+// the mode is read off a value the caller supplied rather than inferred from
+// which key happens to be blank. That also halves the inert-value prose, since
+// there is one string selector to explain instead of two.
+//
+// Both remaining selectors must have a representable "not this one" value that
+// the schema permits. Models routinely pad every declared property rather than
+// omitting keys: "" is inert for handle and 0 for selectionOffset, but `ids`
+// shipped with minItems:1 in v0.13.0 — so the empty array meaning "not naming
+// ids this way" was schema-invalid, a padding model substituted
+// ["placeholder"], and every handle-based call was refused as naming two
+// selectors. Hence no minItems here. maxItems stays: a real bound, not a floor.
 const targetProperties = `
-    "ids": {"type": "array", "items": {"type": "string"}, "maxItems": 200, "description": "Explicit message ids. Use selection instead when the ids came from an email_search you just ran — it is the same set without retyping it. An empty array [] means \"not naming ids this way\" and is exactly equivalent to omitting the key — pad it with [] when you are using selection or receipt."},
-    "selection": {"type": "string", "description": "A selectionId from an email_search result: operates on that search's ids without resending them. Consumes at most 200 ids from selectionOffset; the result reports how many remain."},
-    "selectionOffset": {"type": "integer", "minimum": 0, "default": 0, "description": "Where in the selection to start. A 500-id search feeds three calls at offsets 0, 200, 400 — the ids were pinned at search time, so earlier batches moving mail does not shift the later ones."},
-    "receipt": {"type": "string", "description": "A receiptId from THIS tool's dry run: applies exactly the previewed set. Replaces both ids and confirm — the dry run already did the previewing the confirm phrase exists to force. Re-presenting a receipt whose result you lost returns the original outcome (replayed:true) instead of acting twice."},`
+    "ids": {"type": "array", "items": {"type": "string"}, "maxItems": 200, "description": "Explicit message ids. Prefer handle when the ids came from a search or a dry run you just ran. [] means \"not this way\" and is the same as omitting it."},
+    "handle": {"type": "string", "description": "A selectionId (sel_...) from email_search, or a receiptId (rcp_...) from THIS tool's own dry run — the prefix says which, so the call states which it is using. A selection operates on that search's ids without resending them, at most 200 from selectionOffset. A receipt applies exactly the previewed set and replaces the confirm phrase too, since the dry run already did the previewing; re-presenting one whose result you lost returns the original outcome (replayed:true) rather than acting twice. \"\" means \"not this way\"."},
+    "selectionOffset": {"type": "integer", "minimum": 0, "default": 0, "description": "Where in a sel_ handle to start; ignored for rcp_ ones. A 500-id search feeds three calls at offsets 0, 200, 400 — the ids were pinned at search time, so earlier batches moving mail does not shift the later ones."},`
 
 func schemaMark() json.RawMessage {
 	return json.RawMessage(`{
@@ -357,8 +473,8 @@ func schemaMark() json.RawMessage {
   "properties": {
     "accountId": {"type": "string", "description": "Account id or name; empty for the default account."},` + targetProperties + `
     "action": {"type": "string", "enum": ["", "read", "unread", "flag", "unflag"], "description": "What to change. Required — \"\" is accepted by the schema only so the refusal comes from the tool, naming the four choices, rather than from schema validation."},
-    "dryRun": {"type": "boolean", "default": false, "description": "Report what would change without changing it. Returns a receiptId — prefer applying that over resending ids."},
-    "confirm": {"type": "string", "description": "Required above 20 ids unless a receipt is presented: the exact phrase from the refusal message or the dry run's confirmPhrase, verbatim. The phrase is bound to the exact id set, so it cannot confirm a different batch."},
+    "dryRun": {"type": "boolean", "default": false, "description": "Report what would change without changing it. Returns a receiptId — pass it back as handle rather than resending ids."},
+    "confirm": {"type": "string", "description": "Required above 20 ids unless a rcp_ handle is presented: the exact phrase from the refusal message or the dry run's confirmPhrase, verbatim. The phrase is bound to the exact id set, so it cannot confirm a different batch."},
     "verbose": {"type": "boolean", "description": "List every affected message. Default: lists at or below 20 ids, counts only above it (failed/notFound are always listed in full). Set true to force the list, false to suppress it."}
   },
   "required": ["action"]
@@ -370,10 +486,10 @@ func schemaMove() json.RawMessage {
   "type": "object",
   "properties": {
     "accountId": {"type": "string", "description": "Account id or name; empty for the default account."},` + targetProperties + `
-    "toMailbox": {"type": "string", "description": "Destination mailbox: role, path (Inbox/Gaming), display name, or id. Required except with a receipt, which already carries the destination its dry run resolved (pass it anyway and it must agree)."},
+    "toMailbox": {"type": "string", "description": "Destination mailbox: role, path (Inbox/Gaming), display name, or id. Required except with a rcp_ handle, which already carries the destination its dry run resolved (pass it anyway and it must agree)."},
     "keepInMailboxes": {"type": "boolean", "default": false, "description": "Add the destination instead of replacing the current mailboxes (label-style)."},
-    "dryRun": {"type": "boolean", "default": false, "description": "Report what would move without moving it. Returns a receiptId — prefer applying that over resending ids."},
-    "confirm": {"type": "string", "description": "Required above 20 ids unless a receipt is presented: the exact phrase from the refusal message or the dry run's confirmPhrase, verbatim. The phrase is bound to the exact id set, so it cannot confirm a different batch."},
+    "dryRun": {"type": "boolean", "default": false, "description": "Report what would move without moving it. Returns a receiptId — pass it back as handle rather than resending ids."},
+    "confirm": {"type": "string", "description": "Required above 20 ids unless a rcp_ handle is presented: the exact phrase from the refusal message or the dry run's confirmPhrase, verbatim. The phrase is bound to the exact id set, so it cannot confirm a different batch."},
     "verbose": {"type": "boolean", "description": "List every moved message. Default: lists at or below 20 ids, counts only above it (movedCount plus sources, the per-source-mailbox breakdown, each entry carrying the mailbox id and name; failed/notFound always listed in full). Set true to force the list, false to suppress it."}
   }
 }`)
@@ -384,8 +500,8 @@ func schemaTrash() json.RawMessage {
   "type": "object",
   "properties": {
     "accountId": {"type": "string", "description": "Account id or name; empty for the default account."},` + targetProperties + `
-    "dryRun": {"type": "boolean", "default": false, "description": "Report what would be trashed without trashing it. Returns a receiptId — prefer applying that over resending ids."},
-    "confirm": {"type": "string", "description": "Required above 20 ids unless a receipt is presented: the exact phrase from the refusal message or the dry run's confirmPhrase, verbatim. The phrase is bound to the exact id set, so it cannot confirm a different batch."},
+    "dryRun": {"type": "boolean", "default": false, "description": "Report what would be trashed without trashing it. Returns a receiptId — pass it back as handle rather than resending ids."},
+    "confirm": {"type": "string", "description": "Required above 20 ids unless a rcp_ handle is presented: the exact phrase from the refusal message or the dry run's confirmPhrase, verbatim. The phrase is bound to the exact id set, so it cannot confirm a different batch."},
     "verbose": {"type": "boolean", "description": "List every trashed message. Default: lists at or below 20 ids, counts only above it (failed/notFound are always listed in full). Set true to force the list, false to suppress it."}
   }
 }`)
@@ -395,13 +511,11 @@ func schemaDestroy() json.RawMessage {
 	return json.RawMessage(`{
   "type": "object",
   "properties": {
-    "accountId": {"type": "string", "description": "Account id or name; empty for the default account."},
-    "ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 200},
-    "allowNotInTrash": {"type": "boolean", "default": false, "description": "Also destroy targets that are not already in Trash."},
-    "dryRun": {"type": "boolean", "default": false, "description": "Preview the outcome and get the required confirm phrase."},
-    "confirm": {"type": "string", "description": "Required on every real run: the exact phrase the dryRun returns, verbatim — it is bound to these exact ids and options, so re-run dryRun if anything changes."}
-  },
-  "required": ["ids"]
+    "accountId": {"type": "string", "description": "Account id or name; empty for the default account."},` + targetProperties + `
+    "allowNotInTrash": {"type": "boolean", "default": false, "description": "Also destroy targets that are not already in Trash. A receipt records the gate it previewed under and cannot be applied with this set differently."},
+    "dryRun": {"type": "boolean", "default": false, "description": "Preview the outcome and get both authorizations: a receiptId to pass back as handle, and the confirm phrase. Nothing is destroyed."},
+    "confirm": {"type": "string", "description": "Required on every real run unless a rcp_ handle is presented: the exact phrase the dryRun returns, verbatim — it is bound to these exact ids and options, so re-run dryRun if anything changes."}
+  }
 }`)
 }
 
@@ -411,7 +525,7 @@ func schemaSieveGet() json.RawMessage {
   "properties": {
     "accountId": {"type": "string", "description": "Account id; optional when only one account has stored documents."},
     "name": {"type": "string", "description": "Document name from first-use calibration — never guess; a miss lists what exists."},
-    "version": {"type": "integer", "minimum": 0, "description": "Version to read; 0/absent = head."}
+    "version": {"type": "integer", "minimum": 0, "description": "Version to read; 0/absent = head. Safe to leave at 0: a read only shows you something. The result's meta.version says which version you got — that is the number email_sieve_mark_applied wants if this is the content the user pastes."}
   },
   "required": ["name"]
 }`)
@@ -424,7 +538,7 @@ func schemaSieveDiff() json.RawMessage {
     "accountId": {"type": "string", "description": "Account id; optional when only one account has stored documents."},
     "name": {"type": "string"},
     "from": {"type": "integer", "minimum": 0, "description": "Base version; 0/absent = the applied version."},
-    "to": {"type": "integer", "minimum": 0, "description": "Target version; 0/absent = head."}
+    "to": {"type": "integer", "minimum": 0, "description": "Target version; 0/absent = head. The result echoes the resolved from and to numbers — pass the to value to email_sieve_mark_applied once the user has pasted that version, rather than letting it default."}
   },
   "required": ["name"]
 }`)
@@ -466,7 +580,7 @@ func schemaSieveMarkApplied() json.RawMessage {
   "properties": {
     "accountId": {"type": "string", "description": "Account id; optional when only one account has stored documents."},
     "name": {"type": "string"},
-    "version": {"type": "integer", "minimum": 0, "description": "Version confirmed live; 0/absent = head."},
+    "version": {"type": "integer", "minimum": 0, "description": "The version number you showed the user and they confirmed pasting — required, and NOT defaulted to head: a put between the review and the confirmation moves head without anything reaching the provider, and recording the wrong version is invisible afterwards because every later diff is taken from it. email_sieve_get and email_sieve_diff both report the version they rendered; pass that. 0 is accepted by the schema only so the refusal comes from the tool, naming head and the current applied pointer, rather than from schema validation."},
     "force": {"type": "boolean", "default": false, "description": "Override the truncation-marker guard — only when a flagged version truly is what's live at the provider."}
   },
   "required": ["name"]

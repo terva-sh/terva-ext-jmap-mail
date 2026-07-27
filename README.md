@@ -16,6 +16,13 @@ i.e. Fastmail) and **mail-triage** (survey → candidate rules → preview →
 apply → verify). Sending remains absent. See
 [`docs/implementation-plan.md`](docs/implementation-plan.md).
 
+Much of this extension's design was driven by measured field reports from
+agents using it autonomously. What that taught us about designing tools a
+model can actually drive — selection handles, padding-safe parameters, field
+projections, content-free audit records — is written up separately in
+[`docs/tool-design-practices.md`](docs/tool-design-practices.md), for anyone
+building an MCP server or a tool API of their own.
+
 ## Sieve filter management (opt-in: `enable_sieve_tools`)
 
 Fastmail exposes no sieve API
@@ -100,9 +107,11 @@ All launcher output goes to stderr — terva's stdout is the protocol wire.
 | `email_status` | network-read | config + account + capabilities + server limits + which tools config keeps off; no mail content |
 | `email_list_accounts` | network-read | accounts reachable with the credentials |
 | `email_list_mailboxes` | network-read | folders/labels with roles, display paths, and optional counts; `mailboxes` narrows to named folders and `fields` projects the shape |
-| `email_search` | network-read | filtered search (structured params or a raw JMAP `filterJson`); bounded summaries + previews, never bodies; `hasMore` paging and opt-in exact totals; `fields` projects the result (`["id"]` returns a flat `ids` array and lifts the page limit to 500); results carry a `selectionId` naming the ids for the organize tools |
-| `email_get` | network-read | fetch ≤20 messages; bounded text/html bodies with truncation flags; URL tokens/queries redacted by default (`includeFullUrls` opts out) |
-| `email_get_thread` | network-read | thread by threadId or member email id, capped at the newest 100 messages (20 with bodies) and reporting what it omitted; bodies redact like `email_get` |
+| `email_search` | network-read | filtered search (structured params or a raw JMAP `filterJson`); bounded summaries + previews, never bodies; `hasMore` paging and opt-in exact totals; `fields` projects the result (`["id"]` returns a flat `ids` array); results carry a `selectionId` naming the ids for the organize tools. `returnIds:"none"` drops the array and lifts the page to 2,000 — one page is then one organize call |
+| `email_count` | network-read | several labeled filters counted in one request against one `queryState`, so a table's rows reconcile by construction. No message fetched, no page size, no selection minted |
+| `email_group` | network-read | the distribution of a filtered set as numbers — `groupBy:"from"` ranks senders, `groupBy:"receivedAt"` buckets by age. Returns `{key, total, unread, newest, oldest}` and nothing else about the messages; states `matched` vs `scanned` so a ranking over a window is visibly one. Each group carries a `selectionId`, so acting on a row needs no re-search; also takes a handle, to group a set no filter can express |
+| `email_get` | network-read | fetch ≤20 messages by id or by handle (including a failure group's — that is how you see which messages failed); bounded text/html bodies with truncation flags; URL tokens/queries redacted by default (`includeFullUrls` opts out) |
+| `email_get_thread` | network-read | thread by threadId or member email id, capped at the newest 100 messages (20 with bodies) and reporting what it omitted; bodies redact like `email_get`; carries a `selectionId` naming the **whole** thread, omitted messages included |
 | `email_mark` | external-mutation | mark read/unread, flag/unflag (`$seen`/`$flagged`); ids, `selection`, or `receipt`; dryRun + bulk confirm; counts-only above 20 ids (`verbose`) |
 | `email_move` | external-mutation | move to a mailbox (or add with `keepInMailboxes`); ids, `selection`, or `receipt`; dryRun + bulk confirm; counts + per-source-mailbox breakdown above 20 ids (`verbose`) |
 | `email_trash` | external-mutation | move to Trash — **not** a permanent delete; ids, `selection`, or `receipt`; dryRun + bulk confirm; counts-only above 20 ids (`verbose`) |

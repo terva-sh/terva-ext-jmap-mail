@@ -118,3 +118,60 @@ func mintDestroyPhrase(t *testing.T, svc *mail.Service, p mail.DestroyParams) st
 	}
 	return res.ConfirmPhrase
 }
+
+// The whole chain against a real server, with the model never transcribing an
+// id: search names the set, the preview names what it cleared, the apply names
+// nothing at all. This is the flow the tool descriptions tell it to use, so it
+// is the one that has to work end to end rather than only against a fake.
+func TestIntegrationDestroyBySelectionThenReceipt(t *testing.T) {
+	seed, svc := startStack(t, 0)
+	ctx := context.Background()
+
+	// Put a second message in Trash so the batch is not a single id.
+	if _, err := svc.Trash(ctx, mail.TrashParams{IDs: []string{seed.Newsletter}}); err != nil {
+		t.Fatal(err)
+	}
+	found, err := svc.Search(ctx, mail.SearchParams{Mailbox: "trash", Fields: []string{"id"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found.Returned != 2 || found.SelectionID == "" {
+		t.Fatalf("search returned %d with selectionId %q", found.Returned, found.SelectionID)
+	}
+
+	dry, err := svc.Destroy(ctx, mail.DestroyParams{Handle: found.SelectionID, DryRun: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dry.Destroyed) != 2 || dry.ReceiptID == "" {
+		t.Fatalf("preview over a selection: %d cleared, receipt %q", len(dry.Destroyed), dry.ReceiptID)
+	}
+	if dry.Selection == nil || dry.Selection.Remaining != 0 {
+		t.Errorf("preview did not report consuming the whole selection: %+v", dry.Selection)
+	}
+
+	res, err := svc.Destroy(ctx, mail.DestroyParams{Handle: dry.ReceiptID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Destroyed) != 2 {
+		t.Fatalf("destroyed %d, want both previewed messages", len(res.Destroyed))
+	}
+	trash, err := svc.Search(ctx, mail.SearchParams{Mailbox: "trash"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trash.Returned != 0 {
+		t.Errorf("trash still holds %d messages", trash.Returned)
+	}
+
+	// The receipt keeps answering with what it did. With the mail gone there is
+	// nothing else left to ask.
+	again, err := svc.Destroy(ctx, mail.DestroyParams{Handle: dry.ReceiptID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !again.Replayed || len(again.Destroyed) != 2 {
+		t.Errorf("replay = %+v", again)
+	}
+}

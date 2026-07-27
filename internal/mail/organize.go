@@ -22,12 +22,57 @@ import (
 )
 
 const (
-	// maxSetIDs bounds one mutating call (well under maxObjectsInSet).
+	// maxSetIDs bounds one mutating call named by literal ids. Two hundred
+	// opaque strings is already a large tool call, and the cap is a bound on
+	// ARGUMENT PAYLOAD — which is the whole reason it does not apply below.
 	maxSetIDs = 200
+	// maxHandleSetIDs bounds one mutating call named by a handle. A handle is
+	// one short field: it carries no argument payload, and the set it names was
+	// pinned server-side when the search ran, so the literal-id cap is
+	// inherited from a shape the handle exists to replace.
+	//
+	// A fleet session archived 13,797 messages as 69 applies of 199.96 messages
+	// plus 70 dry runs — 139 calls, 500 of 531 tool-bearing turns carrying
+	// exactly one call, 4h45m. The protocol was executed perfectly; the turn
+	// count was set by an argument-size limit the chosen calling convention
+	// never hits. A wave costs turns × context, so that limit was most of the
+	// bill (TW-049).
+	//
+	// Not unbounded: a call that moves everything must still be interruptible
+	// and must report how far it got, so this is a real ceiling and the work is
+	// chunked underneath it. Ten thousand would fit the timeout on a good day
+	// and not on a bad one; two thousand removes ~90% of the turns and keeps
+	// every failure local.
+	maxHandleSetIDs = 2000
 	// bulkConfirmThreshold: above this many ids, a non-dry run requires the
 	// generated confirm phrase.
 	bulkConfirmThreshold = 20
+	// mutationChunkFallback is the per-request slice when the session
+	// advertises no object limits.
+	mutationChunkFallback = 200
 )
+
+// mutationChunk is how many messages one request may carry. A chunk is an
+// Email/get and an Email/set over the same ids in one batch, so it must fit
+// under BOTH server limits — exceeding either is a request-level error that
+// would fail the whole wave rather than one slice of it.
+func mutationChunk(sess *jmap.Session) int {
+	core, ok := sess.CoreLimits()
+	if !ok {
+		return mutationChunkFallback
+	}
+	chunk := mutationChunkFallback
+	if core.MaxObjectsInGet > 0 {
+		chunk = int(core.MaxObjectsInGet)
+	}
+	if core.MaxObjectsInSet > 0 && int(core.MaxObjectsInSet) < chunk {
+		chunk = int(core.MaxObjectsInSet)
+	}
+	if chunk < 1 {
+		chunk = 1
+	}
+	return chunk
+}
 
 // --- mark ---
 
@@ -48,11 +93,11 @@ var markActions = map[string]markAction{
 // MarkParams are the email_mark inputs.
 type MarkParams struct {
 	Account string
-	// IDs, Selection, and Receipt are three ways to name the same thing and
-	// are mutually exclusive; see resolveTargets.
-	Selection       string
+	// Handle and IDs are two ways to name the same thing and are mutually
+	// exclusive. Handle is a selectionId (sel_…) or a receiptId (rcp_…); the
+	// prefix says which, so the call states its own mode. See resolveTargets.
+	Handle          string
 	SelectionOffset int
-	Receipt         string
 	IDs             []string
 	Action          string // read | unread | flag | unflag
 	DryRun          bool
@@ -71,16 +116,22 @@ type MarkChange struct {
 // omitted on bulk runs (see enumerateChanges) — the counts always stand, and
 // Failed/NotFound are never abridged.
 type MarkResult struct {
-	AccountID       string            `json:"accountId"`
-	Action          string            `json:"action"`
-	DryRun          bool              `json:"dryRun,omitempty"`
-	ConfirmPhrase   string            `json:"confirmPhrase,omitempty"` // on bulk dry runs: the phrase the real run needs
-	ChangedCount    int               `json:"changedCount"`
-	AlreadySetCount int               `json:"alreadySetCount"`
-	Changed         []MarkChange      `json:"changed,omitempty"`
-	AlreadySet      []MarkChange      `json:"alreadySet,omitempty"`
-	Failed          map[string]string `json:"failed,omitempty"`
-	NotFound        []string          `json:"notFound,omitempty"`
+	AccountID       string       `json:"accountId"`
+	Action          string       `json:"action"`
+	DryRun          bool         `json:"dryRun,omitempty"`
+	ConfirmPhrase   string       `json:"confirmPhrase,omitempty"` // on bulk dry runs: the phrase the real run needs
+	ChangedCount    int          `json:"changedCount"`
+	AlreadySetCount int          `json:"alreadySetCount"`
+	Changed         []MarkChange `json:"changed,omitempty"`
+	AlreadySet      []MarkChange `json:"alreadySet,omitempty"`
+	// Failed and NotFound list ids outright, and are populated only while the
+	// run is small enough to enumerate. Above that they would be the payload
+	// problem the handles exist to solve, arriving through the one field
+	// nobody had bounded — see failures.go. Failures always carries the same
+	// information grouped by cause, with a handle per group.
+	Failed   map[string]string `json:"failed,omitempty"`
+	NotFound []string          `json:"notFound,omitempty"`
+	failureReport
 
 	// ReceiptID is minted by a dry run: present it to the real run in place of
 	// the ids AND the confirm phrase.
@@ -100,6 +151,9 @@ type MarkResult struct {
 	// applied — nothing was re-sent to the provider.
 	Replayed  bool   `json:"replayed,omitempty"`
 	AppliedAt string `json:"appliedAt,omitempty"`
+	// partialRun is populated only when the run stopped part-way through a
+	// handle-named set too large for one request.
+	partialRun
 
 	// snapshot is the per-id keyword fingerprint this run observed, carried
 	// out of markInto for the receipt to record. Never serialized.
@@ -119,13 +173,13 @@ func (s *Service) Mark(ctx context.Context, p MarkParams) (*MarkResult, error) {
 		return nil, err
 	}
 	ts, err := s.resolveTargets(accountID, targetRefs{
-		IDs: p.IDs, Selection: p.Selection, SelectionOffset: p.SelectionOffset,
-		Receipt: p.Receipt, DryRun: p.DryRun,
+		IDs: p.IDs, Handle: p.Handle, SelectionOffset: p.SelectionOffset,
+		DryRun: p.DryRun,
 	}, receiptMark)
 	if err != nil {
 		return nil, err
 	}
-	if err := validateIDs(ts.ids); err != nil {
+	if err := validateIDs(ts.ids, ts.byHandle); err != nil {
 		return nil, err
 	}
 	if r := ts.receipt; r != nil && r.Action != p.Action {
@@ -172,7 +226,45 @@ func (s *Service) Mark(ctx context.Context, p MarkParams) (*MarkResult, error) {
 // snapshots the current keywords (classifying changed vs already-set), then
 // Email/set applies the patch — skipped entirely on dryRun.
 func (s *Service) markInto(ctx context.Context, sess *jmap.Session, accountID string, ts *targetSet, action markAction, p MarkParams) (*MarkResult, error) {
-	ids := ts.ids
+	enumerate := enumerateChanges(p.Verbose, len(ts.ids))
+	result := &MarkResult{
+		AccountID: accountID, Action: p.Action, DryRun: p.DryRun,
+		snapshot: make(map[string]string, len(ts.ids)),
+	}
+	fails := newFailureAccum()
+	chunk := mutationChunk(sess)
+	for start := 0; start < len(ts.ids); start += chunk {
+		end := start + chunk
+		if end > len(ts.ids) {
+			end = len(ts.ids)
+		}
+		err := s.markChunk(ctx, sess, accountID, ts.ids[start:end], action, p.DryRun, enumerate, result, fails)
+		if err == nil {
+			continue
+		}
+		if start == 0 {
+			return nil, err
+		}
+		s.abortPartial(&result.partialRun, accountID, ts.ids, start, err)
+		break
+	}
+	if r := ts.receipt; r != nil {
+		for _, d := range driftedStates(r.Snapshot, r.IDs, result.snapshot) {
+			result.Drifted = append(result.Drifted, DriftedKeyword{
+				ID: d.ID, Keyword: action.keyword, Was: d.Was, Now: d.Now,
+			})
+		}
+		if len(result.Drifted) > 0 {
+			result.DriftNote = driftNote
+		}
+	}
+	s.attachFailures(&result.failureReport, accountID, fails, enumerate, &result.Failed, &result.NotFound)
+	return result, nil
+}
+
+// markChunk is one request's worth of markInto, accumulating into the caller's
+// result the same way moveChunk does.
+func (s *Service) markChunk(ctx context.Context, sess *jmap.Session, accountID string, ids []string, action markAction, dryRun, enumerate bool, result *MarkResult, fails *failureAccum) error {
 	calls := []jmap.Invocation{{
 		Name: "Email/get",
 		Args: map[string]any{
@@ -182,7 +274,7 @@ func (s *Service) markInto(ctx context.Context, sess *jmap.Session, accountID st
 		},
 		CallID: "g0",
 	}}
-	if !p.DryRun {
+	if !dryRun {
 		update := map[string]any{}
 		for _, id := range ids {
 			patch := map[string]any{}
@@ -202,16 +294,16 @@ func (s *Service) markInto(ctx context.Context, sess *jmap.Session, accountID st
 
 	resp, err := s.call(ctx, sess, calls)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	gres, err := resp.Result("g0")
 	if err != nil {
-		if !p.DryRun {
+		if !dryRun {
 			// Methods in a batch execute independently (RFC 8620 §3.2): a
 			// get-level error does not undo the set that followed it.
-			return nil, fmt.Errorf("%w — note: the mutation in the same batch may still have applied; verify with email_search before retrying", err)
+			return fmt.Errorf("%w — note: the mutation in the same batch may still have applied; verify with email_search before retrying", err)
 		}
-		return nil, err
+		return err
 	}
 	var got struct {
 		List []struct {
@@ -222,34 +314,29 @@ func (s *Service) markInto(ctx context.Context, sess *jmap.Session, accountID st
 		NotFound []string `json:"notFound"`
 	}
 	if err := json.Unmarshal(gres.Args, &got); err != nil {
-		return nil, fmt.Errorf("parse Email/get response: %v", err)
+		return fmt.Errorf("parse Email/get response: %v", err)
 	}
-
-	enumerate := enumerateChanges(p.Verbose, len(ids))
-	result := &MarkResult{
-		AccountID: accountID, Action: p.Action, DryRun: p.DryRun, NotFound: got.NotFound,
-		snapshot: make(map[string]string, len(got.List)),
+	for _, id := range got.NotFound {
+		fails.add("notFound", id, "the message was not found when the run snapshotted it")
 	}
+	result.NotFound = mergeNotFound(result.NotFound, got.NotFound)
 	for _, e := range got.List {
 		result.snapshot[e.ID] = keywordKey(e.Keywords, action.keyword)
 	}
-	if r := ts.receipt; r != nil {
-		for _, d := range driftedStates(r.Snapshot, r.IDs, result.snapshot) {
-			result.Drifted = append(result.Drifted, DriftedKeyword{
-				ID: d.ID, Keyword: action.keyword, Was: d.Was, Now: d.Now,
-			})
-		}
-		if len(result.Drifted) > 0 {
-			result.DriftNote = driftNote
-		}
-	}
+
 	var outcome *setOutcome
-	if !p.DryRun {
+	if !dryRun {
 		if outcome, err = parseSetResult(resp, "s1"); err != nil {
-			return nil, err
+			return err
 		}
-		var setNotFound []string
-		result.Failed, setNotFound = outcome.failures()
+		outcome.collectFailures(fails)
+		failed, setNotFound := outcome.failures()
+		for id, reason := range failed {
+			if result.Failed == nil {
+				result.Failed = map[string]string{}
+			}
+			result.Failed[id] = reason
+		}
 		result.NotFound = mergeNotFound(result.NotFound, setNotFound)
 	}
 	for _, e := range got.List {
@@ -269,7 +356,7 @@ func (s *Service) markInto(ctx context.Context, sess *jmap.Session, accountID st
 			}
 		}
 	}
-	return result, nil
+	return nil
 }
 
 // --- move / trash ---
@@ -277,11 +364,11 @@ func (s *Service) markInto(ctx context.Context, sess *jmap.Session, accountID st
 // MoveParams are the email_move inputs.
 type MoveParams struct {
 	Account string
-	// IDs, Selection, and Receipt are three ways to name the same thing and
-	// are mutually exclusive; see resolveTargets.
-	Selection       string
+	// Handle and IDs are two ways to name the same thing and are mutually
+	// exclusive. Handle is a selectionId (sel_…) or a receiptId (rcp_…); the
+	// prefix says which, so the call states its own mode. See resolveTargets.
+	Handle          string
 	SelectionOffset int
-	Receipt         string
 	IDs             []string
 	// ToMailbox is an id, role, path, or display name. Required, except with a
 	// Receipt — which already carries the destination its dry run resolved.
@@ -348,10 +435,14 @@ type MoveResult struct {
 	// move always renders the same bytes. This is the whole of the source
 	// information on a bulk run, where Moved (and the per-message From refs
 	// inside it) is omitted.
-	Sources  []MailboxCount    `json:"sources,omitempty"`
-	Moved    []MoveChange      `json:"moved,omitempty"`
+	Sources []MailboxCount `json:"sources,omitempty"`
+	Moved   []MoveChange   `json:"moved,omitempty"`
+	// Failed and NotFound list ids outright, and are populated only while the
+	// run is small enough to enumerate; Failures always carries the same
+	// information grouped by cause, with a handle per group. See failures.go.
 	Failed   map[string]string `json:"failed,omitempty"`
 	NotFound []string          `json:"notFound,omitempty"`
+	failureReport
 
 	// ReceiptID is minted by a dry run: present it to the real run in place of
 	// the ids AND the confirm phrase.
@@ -371,6 +462,9 @@ type MoveResult struct {
 	// applied — nothing was re-sent to the provider.
 	Replayed  bool   `json:"replayed,omitempty"`
 	AppliedAt string `json:"appliedAt,omitempty"`
+	// partialRun is populated only when the run stopped part-way through a
+	// handle-named set too large for one request.
+	partialRun
 
 	// snapshot is the per-id placement fingerprint this run observed, carried
 	// out of moveInto for the receipt to record. Never serialized.
@@ -381,21 +475,23 @@ type MoveResult struct {
 // replaces every current mailbox (a true move); KeepInMailboxes adds it
 // instead (label-style).
 func (s *Service) Move(ctx context.Context, p MoveParams) (*MoveResult, error) {
-	if strings.TrimSpace(p.ToMailbox) == "" && p.Receipt == "" {
-		return nil, fmt.Errorf("toMailbox is required")
+	// A receipt already carries the destination its dry run resolved, so it is
+	// the one shape that needs no toMailbox.
+	if strings.TrimSpace(p.ToMailbox) == "" && !strings.HasPrefix(strings.TrimSpace(p.Handle), receiptPrefix) {
+		return nil, fmt.Errorf("toMailbox is required (except with a receipt handle, which already carries the destination its dry run resolved)")
 	}
 	accountID, sess, err := s.account(ctx, p.Account)
 	if err != nil {
 		return nil, err
 	}
 	ts, err := s.resolveTargets(accountID, targetRefs{
-		IDs: p.IDs, Selection: p.Selection, SelectionOffset: p.SelectionOffset,
-		Receipt: p.Receipt, DryRun: p.DryRun,
+		IDs: p.IDs, Handle: p.Handle, SelectionOffset: p.SelectionOffset,
+		DryRun: p.DryRun,
 	}, receiptMove)
 	if err != nil {
 		return nil, err
 	}
-	if err := validateIDs(ts.ids); err != nil {
+	if err := validateIDs(ts.ids, ts.byHandle); err != nil {
 		return nil, err
 	}
 
@@ -461,11 +557,11 @@ func (s *Service) Move(ctx context.Context, p MoveParams) (*MoveResult, error) {
 // TrashParams are the email_trash inputs.
 type TrashParams struct {
 	Account string
-	// IDs, Selection, and Receipt are three ways to name the same thing and
-	// are mutually exclusive; see resolveTargets.
-	Selection       string
+	// Handle and IDs are two ways to name the same thing and are mutually
+	// exclusive. Handle is a selectionId (sel_…) or a receiptId (rcp_…); the
+	// prefix says which, so the call states its own mode. See resolveTargets.
+	Handle          string
 	SelectionOffset int
-	Receipt         string
 	IDs             []string
 	DryRun          bool
 	Confirm         string
@@ -480,13 +576,13 @@ func (s *Service) Trash(ctx context.Context, p TrashParams) (*MoveResult, error)
 		return nil, err
 	}
 	ts, err := s.resolveTargets(accountID, targetRefs{
-		IDs: p.IDs, Selection: p.Selection, SelectionOffset: p.SelectionOffset,
-		Receipt: p.Receipt, DryRun: p.DryRun,
+		IDs: p.IDs, Handle: p.Handle, SelectionOffset: p.SelectionOffset,
+		DryRun: p.DryRun,
 	}, receiptTrash)
 	if err != nil {
 		return nil, err
 	}
-	if err := validateIDs(ts.ids); err != nil {
+	if err := validateIDs(ts.ids, ts.byHandle); err != nil {
 		return nil, err
 	}
 	// The Trash mailbox is resolved by role and cannot be re-pointed by a
@@ -535,7 +631,67 @@ func (s *Service) Trash(ctx context.Context, p TrashParams) (*MoveResult, error)
 // each message's current mailboxes (the "from" report), then Email/set applies
 // either a whole-mailboxIds replace or an additive patch — skipped on dryRun.
 func (s *Service) moveInto(ctx context.Context, sess *jmap.Session, accountID string, ts *targetSet, dest Mailbox, keep, dryRun, enumerate bool) (*MoveResult, error) {
-	ids := ts.ids
+	destRef := MailboxRef{ID: dest.ID, Name: dest.Name, Role: dest.Role}
+	// Path only when it says something the name does not — the same rule
+	// mailboxRefsByID applies, and the reason the confirm phrase quotes the
+	// path rather than the name.
+	if dest.Path != dest.Name {
+		destRef.Path = dest.Path
+	}
+	result := &MoveResult{
+		AccountID:       accountID,
+		DryRun:          dryRun,
+		Destination:     destRef,
+		KeptInMailboxes: keep,
+		snapshot:        make(map[string]string, len(ts.ids)),
+	}
+	sources := map[string]*MailboxCount{}
+	fails := newFailureAccum()
+
+	// One chunk per request, sized to the server's own object limits. Packing
+	// several chunks into one request would be fewer round trips and a worse
+	// failure story: when a request fails there would be no telling which of
+	// its chunks landed, and on a run this size "somewhere in the middle" is
+	// not an answer a caller can act on.
+	chunk := mutationChunk(sess)
+	for start := 0; start < len(ts.ids); start += chunk {
+		end := start + chunk
+		if end > len(ts.ids) {
+			end = len(ts.ids)
+		}
+		err := s.moveChunk(ctx, sess, accountID, ts.ids[start:end], dest, keep, dryRun, enumerate, result, sources, fails)
+		if err == nil {
+			continue
+		}
+		if start == 0 {
+			// Nothing landed, so there is no partial outcome to describe and
+			// the error is the whole story.
+			return nil, err
+		}
+		s.abortPartial(&result.partialRun, accountID, ts.ids, start, err)
+		break
+	}
+
+	// Drift is compared once, over everything actually scanned. Each chunk's
+	// Email/get runs before its own Email/set, so every fingerprint here is
+	// pre-mutation on both the preview and the apply — like for like. A
+	// difference means something else moved the message in between.
+	if r := ts.receipt; r != nil {
+		if drift := driftedStates(r.Snapshot, r.IDs, result.snapshot); len(drift) > 0 {
+			result.Drifted = s.annotateDrift(ctx, sess, accountID, drift)
+			result.DriftNote = driftNote
+		}
+	}
+	result.Sources = sortedSources(sources)
+	s.attachFailures(&result.failureReport, accountID, fails, enumerate, &result.Failed, &result.NotFound)
+	return result, nil
+}
+
+// moveChunk is one request's worth of moveInto: Email/get snapshots the
+// current mailboxes, then Email/set applies the patch in the same batch. It
+// accumulates into the caller's result rather than returning its own, so a run
+// that stops halfway still holds everything the completed chunks reported.
+func (s *Service) moveChunk(ctx context.Context, sess *jmap.Session, accountID string, ids []string, dest Mailbox, keep, dryRun, enumerate bool, result *MoveResult, sources map[string]*MailboxCount, fails *failureAccum) error {
 	calls := []jmap.Invocation{{
 		Name: "Email/get",
 		Args: map[string]any{
@@ -563,16 +719,16 @@ func (s *Service) moveInto(ctx context.Context, sess *jmap.Session, accountID st
 
 	resp, err := s.call(ctx, sess, calls)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	gres, err := resp.Result("g0")
 	if err != nil {
 		if !dryRun {
 			// Methods in a batch execute independently (RFC 8620 §3.2): a
 			// get-level error does not undo the set that followed it.
-			return nil, fmt.Errorf("%w — note: the mutation in the same batch may still have applied; verify with email_search before retrying", err)
+			return fmt.Errorf("%w — note: the mutation in the same batch may still have applied; verify with email_search before retrying", err)
 		}
-		return nil, err
+		return err
 	}
 	var got struct {
 		List []struct {
@@ -583,46 +739,31 @@ func (s *Service) moveInto(ctx context.Context, sess *jmap.Session, accountID st
 		NotFound []string `json:"notFound"`
 	}
 	if err := json.Unmarshal(gres.Args, &got); err != nil {
-		return nil, fmt.Errorf("parse Email/get response: %v", err)
+		return fmt.Errorf("parse Email/get response: %v", err)
 	}
-
-	destRef := MailboxRef{ID: dest.ID, Name: dest.Name, Role: dest.Role}
-	// Path only when it says something the name does not — the same rule
-	// mailboxRefsByID applies, and the reason the confirm phrase quotes the
-	// path rather than the name.
-	if dest.Path != dest.Name {
-		destRef.Path = dest.Path
+	for _, id := range got.NotFound {
+		fails.add("notFound", id, "the message was not found when the run snapshotted it")
 	}
-	result := &MoveResult{
-		AccountID:       accountID,
-		DryRun:          dryRun,
-		Destination:     destRef,
-		KeptInMailboxes: keep,
-		NotFound:        got.NotFound,
-		snapshot:        make(map[string]string, len(got.List)),
-	}
+	result.NotFound = mergeNotFound(result.NotFound, got.NotFound)
 	for _, e := range got.List {
 		result.snapshot[e.ID] = placementKey(e.MailboxIDs)
 	}
-	// The Email/get above runs before the Email/set in the same batch, so this
-	// snapshot is pre-mutation on both the preview and the apply — like for
-	// like. A difference means something else moved the message in between.
-	if r := ts.receipt; r != nil {
-		if drift := driftedStates(r.Snapshot, r.IDs, result.snapshot); len(drift) > 0 {
-			result.Drifted = s.annotateDrift(ctx, sess, accountID, drift)
-			result.DriftNote = driftNote
-		}
-	}
+
 	var outcome *setOutcome
 	if !dryRun {
 		if outcome, err = parseSetResult(resp, "s1"); err != nil {
-			return nil, err
+			return err
 		}
-		var setNotFound []string
-		result.Failed, setNotFound = outcome.failures()
+		outcome.collectFailures(fails)
+		failed, setNotFound := outcome.failures()
+		for id, reason := range failed {
+			if result.Failed == nil {
+				result.Failed = map[string]string{}
+			}
+			result.Failed[id] = reason
+		}
 		result.NotFound = mergeNotFound(result.NotFound, setNotFound)
 	}
-	sources := map[string]*MailboxCount{}
 	for _, e := range got.List {
 		if outcome != nil && !outcome.updatedOK(e.ID) {
 			continue // reported in Failed
@@ -641,8 +782,51 @@ func (s *Service) moveInto(ctx context.Context, sess *jmap.Session, accountID st
 			result.Moved = append(result.Moved, MoveChange{ID: e.ID, Subject: e.Subject, From: from})
 		}
 	}
-	result.Sources = sortedSources(sources)
-	return result, nil
+	return nil
+}
+
+// partialRun is the shared "this call stopped early" report, embedded in both
+// mutation results. Raising the handle cap made a call able to fail in the
+// middle for the first time: at 200 messages a failure was the whole call, and
+// at 2,000 it can be the fourth chunk of ten. Trading 69 recoverable turns for
+// one unrecoverable one would be a bad bargain, so a stopped run says how far
+// it got and hands back a handle naming what is left.
+type partialRun struct {
+	Aborted bool `json:"aborted,omitempty"`
+	// AppliedTo is how many of the named messages were actually reached before
+	// the stop — a boundary, not an estimate: the chunks before it completed
+	// and the chunks after it never went out.
+	AppliedTo int `json:"appliedTo,omitempty"`
+	// AbortReason is the underlying failure, verbatim.
+	AbortReason string `json:"abortReason,omitempty"`
+	// RemainingSelectionID names the messages that were NOT processed, as a
+	// fresh selection handle. Finishing the job is a dry run and an apply
+	// against it — the same two calls as any other batch, with no ids to
+	// recover from a result that failed.
+	RemainingSelectionID string `json:"remainingSelectionId,omitempty"`
+	RemainingCount       int    `json:"remainingCount,omitempty"`
+	AbortNote            string `json:"abortNote,omitempty"`
+}
+
+const abortNote = "this call stopped part-way: everything up to appliedTo was applied and nothing after it was attempted. remainingSelectionId names the untouched messages — dry-run and apply it to finish, rather than re-running the original set, which would redo work that already landed."
+
+// abortPartial records a mid-run stop and mints a handle over the tail.
+// Minting can fail to be useful (the ids are held in memory and the store may
+// evict), so the count is reported either way: knowing how many are left is
+// what tells a caller whether to chase them.
+func (s *Service) abortPartial(p *partialRun, accountID string, ids []string, done int, err error) {
+	p.Aborted = true
+	p.AppliedTo = done
+	p.AbortReason = err.Error()
+	p.AbortNote = abortNote
+	rest := ids[done:]
+	p.RemainingCount = len(rest)
+	if len(rest) > 0 {
+		p.RemainingSelectionID = s.handles.putSelection(&selection{
+			AccountID: accountID,
+			IDs:       append([]string(nil), rest...),
+		})
+	}
 }
 
 // annotateDrift turns the raw placement keys into named mailboxes, resolving
@@ -718,9 +902,8 @@ type SelectionUse struct {
 // resolution.
 type targetRefs struct {
 	IDs             []string
-	Selection       string
+	Handle          string
 	SelectionOffset int
-	Receipt         string
 	DryRun          bool
 }
 
@@ -730,6 +913,10 @@ type targetSet struct {
 	ids       []string
 	selection *SelectionUse
 	receipt   *receipt
+	// byHandle records that a handle named this set rather than literal ids,
+	// which is what decides the size cap: the cap bounds argument payload, and
+	// a handle is one field. See validateIDs.
+	byHandle bool
 }
 
 // resolveTargets turns the three ways of naming a set into one id list. They
@@ -754,50 +941,44 @@ func (s *Service) resolveTargets(accountID string, r targetRefs, kind receiptKin
 			ids = append(ids, id)
 		}
 	}
-	sel, rcptID := strings.TrimSpace(r.Selection), strings.TrimSpace(r.Receipt)
+	handle := strings.TrimSpace(r.Handle)
 
-	named := 0
-	for _, set := range []bool{len(ids) > 0, sel != "", rcptID != ""} {
-		if set {
-			named++
-		}
-	}
 	switch {
-	case named == 0:
-		return nil, fmt.Errorf("name the messages: ids, selection (from an email_search result's selectionId), or receipt (from this tool's own dry run)")
-	case named > 1:
-		// Spell out the corrected calls. The model that hits this is usually
+	case handle == "" && len(ids) == 0:
+		return nil, fmt.Errorf("name the messages: handle (a selectionId from email_search, or a receiptId from this tool's dry run), or ids")
+	case handle != "" && len(ids) > 0:
+		// Spell out the corrected calls. The model that lands here is usually
 		// padding rather than confused about the contract, and it needs to be
 		// told which inert value to pad with — otherwise it varies the
-		// placeholder and retries forever.
-		return nil, fmt.Errorf("pass exactly one of ids, selection, or receipt — each names the whole set on its own. "+
-			"To use the handle, send ids as [] (or omit it): {\"selection\": %q} or {\"receipt\": %q}. "+
-			"To use the ids, send selection and receipt as \"\" (or omit them). "+
-			"An empty array, an empty string, and an absent key all mean \"not this one\"",
-			firstNonEmpty(sel, "sel_…"), firstNonEmpty(rcptID, "rcp_…"))
+		// placeholder and retries forever (the v0.13.0 wave).
+		return nil, fmt.Errorf("pass a handle or ids, not both — each names the whole set on its own. "+
+			"To use the handle, send ids as []: {\"handle\": %q}. To use the ids, send handle as \"\". "+
+			"An empty array, an empty string, and an absent key all mean \"not this one\"", handle)
 	}
 
+	// The handle's prefix says which protocol this is, so the call states its
+	// own mode instead of leaving a reader to test fields for emptiness.
 	switch {
-	case rcptID != "":
+	case strings.HasPrefix(handle, receiptPrefix):
 		if r.DryRun {
-			return nil, fmt.Errorf("a receipt names an apply, not a preview — it was minted BY a dry run; pass selection or ids to preview again")
+			return nil, fmt.Errorf("a receipt names an apply, not a preview — it was minted BY a dry run; pass a selection handle or ids to preview again")
 		}
-		rcpt, err := s.handles.getReceipt(rcptID, kind)
+		rcpt, err := s.handles.getReceipt(handle, kind)
 		if err != nil {
 			return nil, err
 		}
 		if rcpt.AccountID != accountID {
-			return nil, fmt.Errorf("receipt %q was minted for account %s, not %s", rcptID, rcpt.AccountID, accountID)
+			return nil, fmt.Errorf("receipt %q was minted for account %s, not %s", handle, rcpt.AccountID, accountID)
 		}
-		return &targetSet{ids: rcpt.IDs, receipt: rcpt}, nil
+		return &targetSet{ids: rcpt.IDs, receipt: rcpt, byHandle: true}, nil
 
-	case sel != "":
-		held, err := s.handles.getSelection(sel)
+	case strings.HasPrefix(handle, selectionPrefix):
+		held, err := s.handles.getSelection(handle)
 		if err != nil {
 			return nil, err
 		}
 		if held.AccountID != accountID {
-			return nil, fmt.Errorf("selection %q was minted for account %s, not %s — re-run email_search against the account you mean", sel, held.AccountID, accountID)
+			return nil, fmt.Errorf("selection %q was minted for account %s, not %s — re-run email_search against the account you mean", handle, held.AccountID, accountID)
 		}
 		offset := r.SelectionOffset
 		if offset < 0 {
@@ -807,11 +988,12 @@ func (s *Service) resolveTargets(accountID string, r targetRefs, kind receiptKin
 			return nil, fmt.Errorf("selectionOffset %d is at or past the end of selection %q (%d ids) — the selection is fully consumed", offset, held.ID, len(held.IDs))
 		}
 		slice := held.IDs[offset:]
-		if len(slice) > maxSetIDs {
-			slice = slice[:maxSetIDs]
+		if len(slice) > maxHandleSetIDs {
+			slice = slice[:maxHandleSetIDs]
 		}
 		return &targetSet{
-			ids: slice,
+			ids:      slice,
+			byHandle: true,
 			selection: &SelectionUse{
 				ID:        held.ID,
 				Offset:    offset,
@@ -819,18 +1001,15 @@ func (s *Service) resolveTargets(accountID string, r targetRefs, kind receiptKin
 				Remaining: len(held.IDs) - offset - len(slice),
 			},
 		}, nil
+
+	case handle != "":
+		// A handle whose prefix names neither protocol. Say what the two look
+		// like rather than "unknown handle": the caller has something in hand
+		// and needs to know which tool mints the kind it wants.
+		return nil, fmt.Errorf("handle %q is neither a selectionId (%s…, from an email_search result) nor a receiptId (%s…, from this tool's own dry run)",
+			handle, selectionPrefix, receiptPrefix)
 	}
 	return &targetSet{ids: ids}, nil
-}
-
-// firstNonEmpty returns v when it is set, else the placeholder — so the
-// corrected-call examples in an error can quote the caller's own handle when it
-// gave one, and a shape hint when it did not.
-func firstNonEmpty(v, fallback string) string {
-	if v != "" {
-		return v
-	}
-	return fallback
 }
 
 // checkReceiptDestination refuses a toMailbox that names something other than
@@ -947,12 +1126,24 @@ func mailboxLabels(refs []MailboxRef) string {
 	return strings.Join(out, " + ")
 }
 
-func validateIDs(ids []string) error {
+// validateIDs bounds a resolved target set. The bound depends on how the set
+// was named, because the two caps protect different things: literal ids are
+// argument payload the model had to produce, while a handle is one field
+// naming a set the extension is already holding. byHandle carries that
+// distinction from resolveTargets rather than re-deriving it here.
+func validateIDs(ids []string, byHandle bool) error {
 	if len(ids) == 0 {
 		return fmt.Errorf("ids is required")
 	}
-	if len(ids) > maxSetIDs {
-		return fmt.Errorf("too many ids (%d): operate on at most %d per call", len(ids), maxSetIDs)
+	cap := maxSetIDs
+	if byHandle {
+		cap = maxHandleSetIDs
+	}
+	if len(ids) > cap {
+		if !byHandle {
+			return fmt.Errorf("too many ids (%d): operate on at most %d per call when naming them literally. A selectionId from email_search takes up to %d in one call, and costs one field instead of %d strings", len(ids), maxSetIDs, maxHandleSetIDs, len(ids))
+		}
+		return fmt.Errorf("too many ids (%d): operate on at most %d per call", len(ids), cap)
 	}
 	return nil
 }
@@ -1060,4 +1251,14 @@ func (o *setOutcome) failures() (map[string]string, []string) {
 		out = nil
 	}
 	return out, notFound
+}
+
+// collectFailures folds one chunk's notUpdated into the run's accumulator,
+// keyed by cause. notFound is separated out because it is not a failure of the
+// operation — the message is simply gone — and it is the one group a retry can
+// never help.
+func (o *setOutcome) collectFailures(a *failureAccum) {
+	for id, serr := range o.NotUpdated {
+		a.add(serr.Type, id, serr.Description)
+	}
 }

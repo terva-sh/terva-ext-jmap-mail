@@ -88,10 +88,20 @@ const (
 	defaultSearchLimit = 20
 	maxSearchLimit     = 100
 	// maxProjectedSearchLimit applies when a projection drops preview — the
-	// cap exists to bound payload, and preview is nearly all of it. Bulk
-	// organization ("give me ids, move them") pages at maxSetIDs, so one
-	// projected page covers more than one mutating batch.
+	// cap exists to bound payload, and preview is nearly all of it.
 	maxProjectedSearchLimit = 500
+	// maxHandleSearchLimit applies when returnIds suppresses the id array, so
+	// the page enters the transcript as one selectionId however large it is.
+	// Every one of these caps bounds what the model has to read; this is the
+	// case where the answer is "a token", and it is the cap that decides how
+	// many turns a backlog takes.
+	//
+	// Both halves have to move together to be worth anything. A mutating call
+	// can take maxHandleSetIDs from a handle, but a selection only ever holds
+	// one search page — so leaving this at 500 would have capped a wave at 500
+	// per round trip no matter what the mutation cap said. 13,797 messages is
+	// 7 pages here rather than 28, and 7 applies rather than 69 (TW-049).
+	maxHandleSearchLimit = maxHandleSetIDs
 )
 
 // Search runs Email/query + Email/get as one batched request, the query's ids
@@ -132,6 +142,12 @@ func (s *Service) Search(ctx context.Context, p SearchParams) (*SearchResult, er
 	maxLimit := maxSearchLimit
 	if fields.projected() && !fields.has("preview") {
 		maxLimit = maxProjectedSearchLimit
+	}
+	// Nothing per-message comes back at all under returnIds none/boundaries —
+	// the page is represented by its selectionId — so the payload the other
+	// caps protect does not exist here.
+	if returnIDs != ReturnIDsAll {
+		maxLimit = maxHandleSearchLimit
 	}
 	if limit > maxLimit {
 		limit = maxLimit

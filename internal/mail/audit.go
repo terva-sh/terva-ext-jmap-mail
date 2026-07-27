@@ -32,12 +32,13 @@ import (
 // operational noise); and ids, which are summarized as a count and a digest.
 var auditArgFields = []string{
 	"dryRun", "toMailbox", "action", "keepInMailboxes", "allowNotInTrash", "verbose",
-	"selection", "selectionOffset", "receipt",
+	"handle", "selectionOffset",
 	"mailbox", "mailboxes", "fields", "returnIds", "limit", "position", "sort",
 	"collapseThreads", "includeTotal", "hasAttachment", "keyword", "notKeyword",
 	"after", "before", "bodyFormat", "maxBodyBytes", "includeFullUrls", "includeBodies",
 	"threadId", "emailId",
 	"name", "version", "origin", "unarchive", "includeArchived", "force", "contextOnly", "sourcePath",
+	"groupBy", "interval", "groupLimit", "maxMessages",
 }
 
 // auditResultFields are the outcome fields safe to record: what happened.
@@ -53,6 +54,22 @@ var auditResultFields = []string{
 	"replayed", "appliedAt", "drifted", "driftNote", "notFound", "failed",
 	"returned", "position", "limit", "hasMore", "total", "queryState",
 	"count", "omitted", "threadId",
+	// The aggregates report only shape: how many rows, how much was scanned,
+	// whether it was truncated. `counts` and `groups` are absent on purpose —
+	// a group key IS a sender address, and a count's label plus its echoed
+	// filter is a standing description of what the mailbox holds.
+	"statesDiffered", "matched", "scanned", "truncated", "distinctKeys", "otherTotal",
+	// A thread's own shape. The top-level selectionId above IS admitted, and
+	// deliberately: the token is dead fifteen minutes later, but within one
+	// wave it is what ties the search that minted a handle to the move that
+	// consumed it, which is the only way to read a log of forty calls as one
+	// operation. The per-group and per-failure handles are a different matter
+	// — they ride inside rows that are not allow-listed at all, because a
+	// group's key is a sender address.
+	"omitted", "returned",
+	// The bulk-mutation stop report. How far a run got is exactly the thing an
+	// operator needs from a log when a wave half-landed.
+	"aborted", "appliedTo", "remainingCount",
 	"head", "applied", "versions", "pendingChanges", "archived", "contextOnly",
 }
 
@@ -82,6 +99,14 @@ func AuditDetail(args, result json.RawMessage) (detail map[string]any, account s
 				detail["batch"] = idBatchDigest(ids)
 			}
 		}
+	}
+	// State the target-selection mode rather than leaving a reader to derive
+	// it from which selector survived the inert-value drop. TW-045's first
+	// named cost was exactly that: classifying 139 calls by testing fields for
+	// emptiness. The handle's prefix already carries this, so the record only
+	// has to say out loud what the call now states.
+	if mode := targetMode(detail); mode != "" {
+		detail["mode"] = mode
 	}
 	if raw, ok := in["confirm"]; ok {
 		var phrase string
@@ -115,6 +140,8 @@ func AuditDetail(args, result json.RawMessage) (detail map[string]any, account s
 		"mailboxes":        "mailboxCount",
 		"moved":            "enumerated",
 		"changed":          "enumerated",
+		"groups":           "groupCount",
+		"counts":           "countRows",
 	} {
 		if n, ok := arrayLen(out[key]); ok {
 			detail[name] = n
@@ -132,11 +159,61 @@ func AuditDetail(args, result json.RawMessage) (detail map[string]any, account s
 	if ids, ok := objectIDs(out["notInTrash"]); ok && len(ids) > 0 {
 		detail["blockedIds"] = ids
 	}
+	// Failure groups are recorded as shape only: which causes, how many each.
+	// That is what an operator reviewing a half-landed wave needs. The rest of
+	// the group is not admitted — `reason` is server prose, `ids` are message
+	// ids outside the one destroy exception, and `selectionId` names an
+	// in-memory handle that is dead fifteen minutes after the record is
+	// written, so it would only ever read as a lead that goes nowhere.
+	if groups, ok := failureShape(out["failures"]); ok {
+		detail["failures"] = groups
+	}
 
 	if len(detail) == 0 {
 		return nil, account
 	}
 	return detail, account
+}
+
+// targetMode names how an organize call named its messages, from the handle
+// prefix the caller supplied. Empty for tools that take no handle, and for a
+// call that named neither — a record should not assert a mode for an operation
+// that had none.
+func targetMode(detail map[string]any) string {
+	handle, _ := detail["handle"].(string)
+	switch {
+	case strings.HasPrefix(handle, selectionPrefix):
+		return "selection"
+	case strings.HasPrefix(handle, receiptPrefix):
+		return "receipt"
+	case handle != "":
+		return "unknown" // a handle neither prefix claims; the call was refused
+	case detail["idCount"] != nil:
+		return "ids"
+	}
+	return ""
+}
+
+// failureShape projects a result's failure groups down to cause and count.
+func failureShape(raw json.RawMessage) ([]map[string]any, bool) {
+	if len(raw) == 0 {
+		return nil, false
+	}
+	var groups []struct {
+		Type  string `json:"type"`
+		Count int    `json:"count"`
+	}
+	if json.Unmarshal(raw, &groups) != nil || len(groups) == 0 {
+		return nil, false
+	}
+	out := make([]map[string]any, 0, len(groups))
+	for _, g := range groups {
+		if g.Type == "" {
+			continue
+		}
+		out = append(out, map[string]any{"type": g.Type, "count": g.Count})
+	}
+	return out, len(out) > 0
 }
 
 func copyAllowed(dst map[string]any, src map[string]json.RawMessage, allowed []string) {

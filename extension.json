@@ -1,6 +1,6 @@
 {
   "name": "jmap-mail",
-  "version": "0.16.0",
+  "version": "0.20.0",
   "exec": "./run.sh",
   "language": "go",
   "description": "Read, search, and safely organize mail over JMAP providers such as Fastmail.",

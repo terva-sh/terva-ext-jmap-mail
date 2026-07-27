@@ -315,9 +315,20 @@ func (s *Store) Get(k DocKey, version int) (string, Meta, error) {
 	return s.readVersion(k, v)
 }
 
-// MarkApplied records that a version (0 = head) is now live at the provider.
-// It refuses context-only documents always, and truncation-suspect content
-// unless force overrides (a placeholder must never become the baseline).
+// MarkApplied records that a version is now live at the provider. It refuses
+// context-only documents always, and truncation-suspect content unless force
+// overrides (a placeholder must never become the baseline).
+//
+// version must be explicit. Until v0.19.0 it late-bound 0 to head, which is
+// also the value a padding model sends and the value an absent key decodes to
+// — so the default call recorded "whatever head is right now" as the thing the
+// user had pasted. Those are different claims whenever anything appended a
+// version while the paste was in progress, and the store had no way to notice:
+// the applied pointer would say v6, the provider would hold v5, and every
+// later diff would be computed from the wrong baseline, wrongly and
+// self-consistently. Unlike the reads, this call ASSERTS a fact about the
+// outside world, and a caller that cannot name which version it means does not
+// have that fact to assert.
 func (s *Store) MarkApplied(k DocKey, version int, force bool) (Meta, error) {
 	if err := k.validate(); err != nil {
 		return Meta{}, err
@@ -326,6 +337,9 @@ func (s *Store) MarkApplied(k DocKey, version int, force bool) (Meta, error) {
 	defer s.mu.Unlock()
 	if s.contextOnlyLocked(k) {
 		return Meta{}, fmt.Errorf("%s is a context-only document (reference material) — it is never pasted to the provider, so it cannot be marked applied", k.Name)
+	}
+	if version <= 0 {
+		return Meta{}, s.unnamedVersionErrorLocked(k)
 	}
 	v, err := s.resolveVersion(k, version)
 	if err != nil {
@@ -607,6 +621,35 @@ func (s *Store) infoAtLocked(k DocKey, dir string, archived bool) (DocInfo, erro
 		Archived:    archived,
 		HeadMeta:    headMeta,
 	}, nil
+}
+
+// unnamedVersionErrorLocked is the refusal for a mark_applied that did not say
+// which version it means. It is the whole remedy for the late-binding hazard,
+// so it has to leave the caller one call from correct rather than one call from
+// guessing: it names head, names the applied pointer it would overwrite, and
+// says out loud that head may have moved since whatever the caller reviewed —
+// which is the case that makes the padded call wrong rather than merely vague.
+func (s *Store) unnamedVersionErrorLocked(k DocKey) error {
+	head, err := s.readPointer(k, "head")
+	if err != nil {
+		return err
+	}
+	if head == 0 {
+		return s.noDocErrorLocked(k)
+	}
+	applied, err := s.readPointer(k, "applied")
+	if err != nil {
+		return err
+	}
+	was := "nothing is recorded as applied yet"
+	if applied > 0 {
+		was = fmt.Sprintf("v%d is currently recorded as applied", applied)
+	}
+	return fmt.Errorf("say which version of %s is live: pass version explicitly — head is v%d and %s. "+
+		"Use the version number you actually showed the user, which email_sieve_get and email_sieve_diff both report; "+
+		"it is not necessarily head, because a put in between moves head without anything reaching the provider. "+
+		"Recording the wrong one is not visible afterwards — every later diff is taken from it and reads as correct",
+		k.Name, head, was)
 }
 
 func (s *Store) resolveVersion(k DocKey, version int) (int, error) {

@@ -125,3 +125,48 @@ func TestPaddedBodyFormatIsTheDefault(t *testing.T) {
 		t.Errorf("bodyFormat \"\" must mean text: %+v", res.Emails[0])
 	}
 }
+
+// email_destroy was exempt from this file until v0.18.0: with ids required and
+// minItems:1, there was no padded call to test — the model had to name real
+// ids or send nothing at all. Adding a handle made the exemption dangerous, so
+// the property now has to hold here too, on the one tool where a padding model
+// substituting ["placeholder"] would be refused rather than obeyed only by
+// luck.
+func TestPaddedDestroyReachesTheSameBehaviour(t *testing.T) {
+	// Padded around a handle: ids is the empty array, offset is zero, the two
+	// booleans are false and confirm is blank — none of which is a choice.
+	s := testService(destroyFake())
+	dry, err := s.Destroy(context.Background(), DestroyParams{
+		Account: "", Handle: seedSelection(s, "e-trash"), SelectionOffset: 0,
+		IDs: []string{}, AllowNotInTrash: false, DryRun: true, Confirm: "",
+	})
+	if err != nil {
+		t.Fatalf("a fully padded preview was refused: %v", err)
+	}
+	if dry.ReceiptID == "" || len(dry.Destroyed) != 1 {
+		t.Fatalf("padded preview = %+v", dry)
+	}
+
+	res, err := s.Destroy(context.Background(), DestroyParams{
+		Account: "", Handle: dry.ReceiptID, SelectionOffset: 0,
+		IDs: []string{}, AllowNotInTrash: false, DryRun: false, Confirm: "",
+	})
+	if err != nil {
+		t.Fatalf("a fully padded apply was refused: %v", err)
+	}
+	if len(res.Destroyed) != 1 {
+		t.Fatalf("padded apply = %+v", res)
+	}
+
+	// And the ids path: the same padding around real ids must not read the
+	// blank handle as a third selector or the false gate as a choice.
+	s2 := testService(destroyFake())
+	ids := []string{"e-trash"}
+	if _, err := s2.Destroy(context.Background(), DestroyParams{
+		Account: "", Handle: "", SelectionOffset: 0, IDs: ids,
+		AllowNotInTrash: false, DryRun: false,
+		Confirm: destroyPhrase(ids, false, ""),
+	}); err != nil {
+		t.Fatalf("a fully padded ids run was refused: %v", err)
+	}
+}

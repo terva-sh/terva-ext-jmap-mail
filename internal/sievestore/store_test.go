@@ -113,7 +113,7 @@ func TestAppliedPointerAndPending(t *testing.T) {
 		t.Fatalf("fresh doc info = %+v err=%v (want pending, never applied)", info, err)
 	}
 
-	if _, err := s.MarkApplied(testKey, 0, false); err != nil {
+	if _, err := s.MarkApplied(testKey, 1, false); err != nil {
 		t.Fatal(err)
 	}
 	info, _ = s.Info(testKey)
@@ -234,17 +234,17 @@ func TestGetMissing(t *testing.T) {
 func TestMarkAppliedRefusesTruncationWithoutForce(t *testing.T) {
 	s := newTestStore(t)
 	mustPut(t, s, testKey, "keep;\n[TRUNCATED IN TOOL IMPORT: rest elsewhere]\n", "paste-in", "big paste")
-	if _, err := s.MarkApplied(testKey, 0, false); err == nil || !strings.Contains(err.Error(), "truncated placeholder") {
+	if _, err := s.MarkApplied(testKey, 1, false); err == nil || !strings.Contains(err.Error(), "truncated placeholder") {
 		t.Fatalf("err = %v, want truncation refusal", err)
 	}
-	if _, err := s.MarkApplied(testKey, 0, true); err != nil {
+	if _, err := s.MarkApplied(testKey, 1, true); err != nil {
 		t.Fatalf("force should override: %v", err)
 	}
 
 	// A marker in the NOTE alone also trips the guard.
 	k2 := DocKey{Provider: "api.fastmail.com", Account: "uc9a140ba", Name: "noted"}
 	mustPut(t, s, k2, "keep;\n", "paste-in", "truncated placeholder due to large chat paste")
-	if _, err := s.MarkApplied(k2, 0, false); err == nil {
+	if _, err := s.MarkApplied(k2, 1, false); err == nil {
 		t.Fatal("want refusal from note marker")
 	}
 }
@@ -259,13 +259,13 @@ func TestContextOnlyBlocksMarkApplied(t *testing.T) {
 	if err != nil || !info.ContextOnly {
 		t.Fatalf("info = %+v err=%v, want contextOnly", info, err)
 	}
-	if _, err := s.MarkApplied(testKey, 0, true); err == nil || !strings.Contains(err.Error(), "context-only") {
+	if _, err := s.MarkApplied(testKey, 1, true); err == nil || !strings.Contains(err.Error(), "context-only") {
 		t.Fatalf("err = %v, want context-only refusal (even with force)", err)
 	}
 	if err := s.SetContextOnly(testKey, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.MarkApplied(testKey, 0, false); err != nil {
+	if _, err := s.MarkApplied(testKey, 1, false); err != nil {
 		t.Fatalf("cleared context-only should mark fine: %v", err)
 	}
 	if err := s.SetContextOnly(DocKey{Provider: "p1", Account: "a1", Name: "missing"}, true); err == nil {
@@ -404,7 +404,7 @@ func TestAppendNeverOverwritesOrphanVersion(t *testing.T) {
 func TestPointerWriteLeavesNoTempDroppings(t *testing.T) {
 	s := newTestStore(t)
 	mustPut(t, s, testKey, "keep;\n", "paste-in", "")
-	if _, err := s.MarkApplied(testKey, 0, false); err != nil {
+	if _, err := s.MarkApplied(testKey, 1, false); err != nil {
 		t.Fatal(err)
 	}
 	docDir := filepath.Join(s.root, testKey.Provider, testKey.Account, testKey.Name)
@@ -436,5 +436,84 @@ func TestPutRefusesOverArchivedNamesake(t *testing.T) {
 	}
 	if _, appended, err := s.Put(testKey, "fresh;\n", "paste-in", ""); err != nil || !appended {
 		t.Fatalf("put after unarchive: appended=%v err=%v", appended, err)
+	}
+}
+
+// The reason mark_applied stopped defaulting to head. The store asserts a fact
+// about the outside world — "this text is what the provider is running" — and
+// the only caller who knows it is the one that showed the text to the user. A
+// version resolved at call time is a different claim: it is whatever the last
+// put left behind, which on this timeline is a version nobody has pasted.
+func TestMarkAppliedWillNotGuessWhichVersionWentToTheProvider(t *testing.T) {
+	s := newTestStore(t)
+	mustPut(t, s, testKey, "keep;\n", "paste-in", "v1")
+	if _, err := s.MarkApplied(testKey, 1, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// The agent reviews v2 and the user pastes it...
+	mustPut(t, s, testKey, "keep;\nfileinto \"Lists\";\n", "edit", "v2 — reviewed and pasted")
+	// ...and something appends v3 while that is happening.
+	mustPut(t, s, testKey, "keep;\nfileinto \"Lists\";\nstop;\n", "edit", "v3 — never pasted")
+
+	if _, err := s.MarkApplied(testKey, 0, false); err == nil {
+		info, _ := s.Info(testKey)
+		t.Fatalf("recorded v%d as live without being told which version was pasted", info.Applied)
+	} else {
+		// The refusal has to leave the caller one call from correct: which
+		// version head is, what it would overwrite, and why head is the wrong
+		// guess. Anything vaguer and the model picks head anyway.
+		for _, want := range []string{"v3", "v1 is currently recorded as applied", "not necessarily head", "email_sieve_diff"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("refusal never says %q: %v", want, err)
+			}
+		}
+	}
+
+	// Naming the reviewed version records the reviewed version, not head.
+	if _, err := s.MarkApplied(testKey, 2, false); err != nil {
+		t.Fatal(err)
+	}
+	info, err := s.Info(testKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Applied != 2 {
+		t.Fatalf("applied = v%d, want the version that was actually pasted", info.Applied)
+	}
+	// And the pending state is now honest: v3 really is unapplied.
+	if !info.Pending {
+		t.Error("v3 was never pasted but the document reports nothing pending")
+	}
+	// The diff a later turn takes is from what is live, which was the whole
+	// thing at risk: with head recorded instead, this diff would be empty and
+	// v3 would look shipped.
+	diff, err := s.Diff(testKey, info.Applied, info.Head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(diff, "stop;") {
+		t.Errorf("diff from the applied version does not show the unpasted change:\n%s", diff)
+	}
+}
+
+// The reads keep resolving 0 to head, and must: binding late is only hazardous
+// where the call asserts something. A read that shows you head is showing you
+// head, and it reports which version that was so the number is in front of the
+// caller when the write asks for it.
+func TestReadsStillDefaultToHeadAndSayWhichItWas(t *testing.T) {
+	s := newTestStore(t)
+	mustPut(t, s, testKey, "keep;\n", "paste-in", "v1")
+	mustPut(t, s, testKey, "keep;\nstop;\n", "edit", "v2")
+
+	content, meta, err := s.Get(testKey, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Version != 2 {
+		t.Errorf("get reported version %d, want the head it actually returned", meta.Version)
+	}
+	if !strings.Contains(content, "stop;") {
+		t.Errorf("get(0) did not return head: %q", content)
 	}
 }

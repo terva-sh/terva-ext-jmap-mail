@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -30,9 +31,12 @@ func TestToolSchemasAreValidJSON(t *testing.T) {
 		}
 	}
 
-	// The three organize tools must offer all three ways of naming a set —
-	// a tool missing one silently forces the caller back to retyping ids.
-	for _, name := range []string{"mark", "move", "trash"} {
+	// Every tool that names a set of messages must offer the same ways of
+	// naming it — one missing a selector silently forces the caller back to
+	// retyping ids, on the tool where that matters most. email_destroy joined
+	// this list in v0.18.0; before that it was the one mutation whose 200 ids
+	// had to be transcribed by the model.
+	for _, name := range []string{"mark", "move", "trash", "destroy"} {
 		var out struct {
 			Properties map[string]json.RawMessage `json:"properties"`
 			Required   []string                   `json:"required"`
@@ -40,9 +44,17 @@ func TestToolSchemasAreValidJSON(t *testing.T) {
 		if err := json.Unmarshal(schemas[name], &out); err != nil {
 			t.Fatal(err)
 		}
-		for _, want := range []string{"ids", "selection", "selectionOffset", "receipt"} {
+		for _, want := range []string{"ids", "handle", "selectionOffset"} {
 			if _, ok := out.Properties[want]; !ok {
 				t.Errorf("%s schema is missing %s", name, want)
+			}
+		}
+		// The former three-way shape is gone: a call now states its mode
+		// through the handle's sel_/rcp_ prefix instead of leaving a reader to
+		// test which of three fields is non-empty (TW-045).
+		for _, gone := range []string{"selection", "receipt"} {
+			if _, ok := out.Properties[gone]; ok {
+				t.Errorf("%s schema still declares %s — handle replaced it", name, gone)
 			}
 		}
 		// ids cannot be required: selection and receipt are alternatives to it,
@@ -74,8 +86,14 @@ func TestToolSchemasAreValidJSON(t *testing.T) {
 		}
 	}
 
-	// email_destroy is the exception and must stay one: it accepts no handles,
-	// so ids is genuinely mandatory there and no padding conflict can arise.
+	// email_destroy used to be the exception — ids required, minItems:1 — on
+	// the reasoning that it took no handles so nothing could conflict. The
+	// moment it took one, that pair became the v0.13.0 defect again, aimed at
+	// the unrecoverable tool: a padding model cannot send [] for the selector
+	// it is not using, so it substitutes an id, and the safer handle path is
+	// refused as naming two selectors. The loop above now covers it; this
+	// asserts the specific pair is gone, because it is the pair a future
+	// "ids is obviously required here" edit would reintroduce.
 	var destroy struct {
 		Properties map[string]json.RawMessage `json:"properties"`
 		Required   []string                   `json:"required"`
@@ -83,24 +101,34 @@ func TestToolSchemasAreValidJSON(t *testing.T) {
 	if err := json.Unmarshal(schemas["destroy"], &destroy); err != nil {
 		t.Fatal(err)
 	}
-	var destroyIDs struct {
-		MinItems *int `json:"minItems"`
+	if len(destroy.Required) != 0 {
+		t.Errorf("email_destroy requires %v — a handle names the set instead, so nothing here can be mandatory", destroy.Required)
 	}
-	if err := json.Unmarshal(destroy.Properties["ids"], &destroyIDs); err != nil {
-		t.Fatal(err)
-	}
-	if destroyIDs.MinItems == nil || *destroyIDs.MinItems != 1 {
-		t.Errorf("email_destroy dropped minItems on ids; it takes no handles, so ids is genuinely required there")
-	}
-	if len(destroy.Required) == 0 || destroy.Required[0] != "ids" {
-		t.Errorf("email_destroy no longer requires ids: %v", destroy.Required)
+
+	// email_get joined them in the same release, for the same reason and with
+	// the same trap: `required` there forces a handle-only call to pad a key it
+	// is not using, and makes omitting it a validation failure whose text the
+	// model never sees.
+	for _, name := range []string{"get", "destroy"} {
+		props, required := schemaProps(t, schemas[name])
+		if len(required) != 0 {
+			t.Errorf("%s schema requires %v, but a handle names the set instead", name, required)
+		}
+		for _, want := range []string{"ids", "handle", "selectionOffset"} {
+			if _, ok := props[want]; !ok {
+				t.Errorf("%s schema is missing %s", name, want)
+			}
+		}
+		if props["ids"].MinItems != nil {
+			t.Errorf("%s schema sets minItems on ids — [] must stay valid as the inert padding value", name)
+		}
 	}
 }
 
 // The context policy is the only place the model is told to prefer handles
 // over retyping ids; the tool descriptions alone have not been enough before.
 func TestContextPolicyTeachesHandles(t *testing.T) {
-	for _, want := range []string{"selectionId", "receiptId", "selectionOffset", "NEVER retype", "never a placeholder id"} {
+	for _, want := range []string{"selectionId", "receiptId", "selectionOffset", "handle", "NEVER retype", "never a placeholder id"} {
 		if !strings.Contains(contextPolicy, want) {
 			t.Errorf("contextPolicy never mentions %q", want)
 		}
@@ -124,6 +152,7 @@ func allSchemas() map[string]json.RawMessage {
 		"empty": emptySchema(), "mailboxes": schemaMailboxes(), "search": schemaSearch(),
 		"get": schemaGet(), "mark": schemaMark(), "move": schemaMove(), "trash": schemaTrash(),
 		"destroy": schemaDestroy(), "thread": schemaThread(),
+		"count": schemaCount(), "group": schemaGroup(),
 		"sieveList": schemaSieveList(), "sieveGet": schemaSieveGet(), "sieveDiff": schemaSieveDiff(),
 		"sievePut": schemaSievePut(), "sieveRestore": schemaSieveRestore(),
 		"sieveMarkApplied": schemaSieveMarkApplied(), "sieveArchive": schemaSieveArchive(),
@@ -254,11 +283,11 @@ func TestGetSchemaProjectsLikeItsSiblings(t *testing.T) {
 			t.Errorf("email_get fields cannot name %q, which only email_get returns", want)
 		}
 	}
-	// ids stays genuinely required here, as on email_destroy: email_get takes
-	// no handles, so there is nothing for an inert value to mean.
-	if len(required) == 0 || required[0] != "ids" {
-		t.Errorf("email_get no longer requires ids: %v", required)
-	}
+	// ids used to be required here on the same reasoning email_destroy used —
+	// no handles, so nothing for an inert value to mean. Both stopped being
+	// true in v0.20.0; the required/minItems pair is asserted gone in
+	// TestToolSchemasAreValidJSON alongside the other handle-taking tools.
+	_ = required
 }
 
 // TW-032: the search result must be able to stop returning the ids the
@@ -445,5 +474,144 @@ func TestParseHasAttachment(t *testing.T) {
 	}
 	if _, err := parseHasAttachment(json.RawMessage(`"maybe"`)); err == nil {
 		t.Error("want a refusal naming the valid values")
+	}
+}
+
+// The pre-v0.17.0 `selection` and `receipt` argument names still resolve, and
+// they exist for one reason: a wave in flight when a deployment lands must not
+// start refusing halfway through. TW-027 is what that costs — nineteen
+// rejections and a 2,000-message wave that archived nothing.
+func TestLegacySelectorNamesStillResolve(t *testing.T) {
+	for _, tc := range []struct {
+		name                       string
+		handle, selection, receipt string
+		want, wantErr              string
+	}{
+		{"handle", "sel_abc", "", "", "sel_abc", ""},
+		{"legacy selection", "", "sel_abc", "", "sel_abc", ""},
+		{"legacy receipt", "", "", "rcp_def", "rcp_def", ""},
+		{"none", "", "", "", "", ""},
+		{"padded", "  ", "", "  ", "", ""},
+		{"same value twice is not a conflict", "sel_abc", "sel_abc", "", "sel_abc", ""},
+		{"two different values", "sel_abc", "", "rcp_def", "", "pass one handle"},
+		{"legacy pair in conflict", "", "sel_abc", "rcp_def", "", "pass one handle"},
+	} {
+		got, err := resolveHandle(tc.handle, tc.selection, tc.receipt)
+		switch {
+		case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+			t.Errorf("%s: err = %v, want one mentioning %q", tc.name, err, tc.wantErr)
+		case tc.wantErr == "" && err != nil:
+			t.Errorf("%s: unexpected error %v", tc.name, err)
+		case tc.wantErr == "" && got != tc.want:
+			t.Errorf("%s: handle = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// The sieve write must not reintroduce the default it lost. `version` has to
+// stay representable as 0 (so a padding model reaches the tool and reads the
+// refusal, rather than bouncing off schema validation it never sees) while
+// being absent from `required` for the same reason — and the description has
+// to say that head is not the default, because that is the belief the old
+// schema taught and the one a model will otherwise carry in.
+func TestSieveMarkAppliedDoesNotDefaultToHead(t *testing.T) {
+	var out struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+		Required   []string                   `json:"required"`
+	}
+	if err := json.Unmarshal(schemaSieveMarkApplied(), &out); err != nil {
+		t.Fatal(err)
+	}
+	var version struct {
+		Minimum     *int   `json:"minimum"`
+		Default     *int   `json:"default"`
+		Description string `json:"description"`
+	}
+	if err := json.Unmarshal(out.Properties["version"], &version); err != nil {
+		t.Fatal(err)
+	}
+	if version.Minimum == nil || *version.Minimum != 0 {
+		t.Errorf("version minimum = %v — 0 must stay schema-valid so the tool gets to explain itself", version.Minimum)
+	}
+	if version.Default != nil {
+		t.Errorf("version declares default %v; the whole fix is that it has none", *version.Default)
+	}
+	for _, req := range out.Required {
+		if req == "version" {
+			t.Error("version is in required — a padded call would then fail validation silently instead of reading the refusal")
+		}
+	}
+	if strings.Contains(version.Description, "0/absent = head") {
+		t.Error("the description still promises the late binding that was removed")
+	}
+	for _, want := range []string{"required", "NOT defaulted to head"} {
+		if !strings.Contains(version.Description, want) {
+			t.Errorf("version description never says %q: %s", want, version.Description)
+		}
+	}
+	if !strings.Contains(descSieveMarkApplied, "NOT head by default") {
+		t.Errorf("the tool description does not correct the old default: %s", descSieveMarkApplied)
+	}
+}
+
+// email_search, email_count and email_group all filter the same mail, and a
+// caller that has framed a search must be able to count or group the identical
+// set without translating it. filterProperties is how they cannot drift in the
+// schema; filterArgs is how they cannot drift in the decoder. This pins them to
+// each other — adding a filter param to one place and not the other would give
+// a tool a property it silently ignores.
+func TestFilterSchemaMatchesFilterArgs(t *testing.T) {
+	var block struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+	}
+	if err := json.Unmarshal([]byte(`{"properties":{`+strings.TrimSuffix(filterProperties, ",")+`}}`), &block); err != nil {
+		t.Fatalf("filterProperties is not a valid property block: %v", err)
+	}
+	declared := map[string]bool{}
+	for name := range block.Properties {
+		declared[name] = true
+	}
+
+	decoded := map[string]bool{}
+	rt := reflect.TypeOf(filterArgs{})
+	for i := 0; i < rt.NumField(); i++ {
+		tag := rt.Field(i).Tag.Get("json")
+		if name, _, _ := strings.Cut(tag, ","); name != "" && name != "-" {
+			decoded[name] = true
+		}
+	}
+	for name := range declared {
+		if !decoded[name] {
+			t.Errorf("filterProperties declares %q but filterArgs cannot decode it — the tools would accept and ignore it", name)
+		}
+	}
+	for name := range decoded {
+		if !declared[name] {
+			t.Errorf("filterArgs decodes %q but no schema declares it — no model will ever send it", name)
+		}
+	}
+
+	// And the three tools really do carry the block, rather than each having
+	// grown its own copy.
+	for _, name := range []string{"search", "group"} {
+		props, _ := schemaProps(t, allSchemas()[name])
+		for want := range declared {
+			if _, ok := props[want]; !ok {
+				t.Errorf("%s schema is missing the shared filter property %q", name, want)
+			}
+		}
+	}
+}
+
+// The two aggregates exist to keep message summaries out of the transcript, so
+// neither may offer a way to ask for them back.
+func TestAggregatesCannotReturnMessages(t *testing.T) {
+	for _, name := range []string{"count", "group"} {
+		props, _ := schemaProps(t, allSchemas()[name])
+		for _, forbidden := range []string{"fields", "returnIds", "limit", "position"} {
+			if _, ok := props[forbidden]; ok {
+				t.Errorf("%s schema declares %q — an aggregate that can page or project is a search again", name, forbidden)
+			}
+		}
 	}
 }

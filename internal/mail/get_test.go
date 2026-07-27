@@ -179,3 +179,103 @@ func TestTruncateUTF8(t *testing.T) {
 		t.Errorf("no-op truncation changed string: %q", got)
 	}
 }
+
+// email_get takes a handle, which is what makes a failure group actionable —
+// but its cap does NOT rise the way the organize tools' did. Theirs bounds the
+// ids a caller sends; this one bounds the subjects and bodies coming back, and
+// a handle does nothing about that.
+func TestGetByHandleSlicesAtTheContentCap(t *testing.T) {
+	f := newHandleFake(maxGetIDs * 3)
+	s := testService(f.fake)
+	handle := seedBigSelection(s, f.cohort)
+	ctx := context.Background()
+
+	var seen []string
+	for offset := 0; ; {
+		res, err := s.Get(ctx, GetParams{
+			Handle: handle, SelectionOffset: offset,
+			Fields: []string{"id", "subject"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Selection == nil {
+			t.Fatal("a handle-named read did not report which slice it took")
+		}
+		if res.Selection.Count > maxGetIDs {
+			t.Fatalf("read %d messages, above the %d cap — a handle must not lift a cap on RESULT size",
+				res.Selection.Count, maxGetIDs)
+		}
+		for _, e := range res.Emails {
+			seen = append(seen, e.ID)
+		}
+		if res.Selection.Remaining == 0 {
+			break
+		}
+		offset += res.Selection.Count
+	}
+	if len(seen) != len(f.cohort) {
+		t.Fatalf("slices covered %d of %d messages", len(seen), len(f.cohort))
+	}
+	for i, id := range f.cohort {
+		if seen[i] != id {
+			t.Fatalf("slice %d = %s, want %s", i, seen[i], id)
+		}
+	}
+}
+
+// A read authorizes nothing, so either handle kind names a set here — unlike
+// the mutating path, where a receipt's kind is checked because it is an
+// authorization. "Show me what my dry run covered" is a fair question.
+func TestGetAcceptsEitherHandleKind(t *testing.T) {
+	f := newHandleFake(5)
+	s := testService(f.fake)
+	ctx := context.Background()
+
+	sel := seedBigSelection(s, f.cohort)
+	if res, err := s.Get(ctx, GetParams{Handle: sel, Fields: []string{"id"}}); err != nil {
+		t.Fatalf("selection handle: %v", err)
+	} else if len(res.Emails) != 5 {
+		t.Errorf("read %d of 5", len(res.Emails))
+	}
+
+	rcp := s.handles.putReceipt(&receipt{Kind: receiptMove, AccountID: "A1", IDs: f.cohort[:2]})
+	res, err := s.Get(ctx, GetParams{Handle: rcp, Fields: []string{"id"}})
+	if err != nil {
+		t.Fatalf("receipt handle: %v", err)
+	}
+	if len(res.Emails) != 2 {
+		t.Errorf("read %d of the receipt's 2", len(res.Emails))
+	}
+}
+
+// The same padding contract the organize tools have: both inert values are
+// representable, and naming both selectors is refused with the correction
+// spelled out.
+func TestGetRefusesBothSelectorsAndNeither(t *testing.T) {
+	f := newHandleFake(3)
+	s := testService(f.fake)
+	ctx := context.Background()
+
+	_, err := s.Get(ctx, GetParams{Handle: "", IDs: []string{"", "  "}})
+	if err == nil || !strings.Contains(err.Error(), "name the messages") {
+		t.Fatalf("err = %v", err)
+	}
+	_, err = s.Get(ctx, GetParams{Handle: "sel_x", IDs: []string{"e1"}})
+	if err == nil || !strings.Contains(err.Error(), "not both") {
+		t.Fatalf("err = %v", err)
+	}
+	// A handle neither prefix claims says so, rather than reading as unknown.
+	if _, err := s.Get(ctx, GetParams{Handle: "xyz_bogus"}); err == nil ||
+		!strings.Contains(err.Error(), "neither a selectionId") {
+		t.Fatalf("err = %v", err)
+	}
+	// Literal ids keep their own cap and their own message.
+	many := make([]string, maxGetIDs+1)
+	for i := range many {
+		many[i] = "e1"
+	}
+	if _, err := s.Get(ctx, GetParams{IDs: many}); err == nil || !strings.Contains(err.Error(), "too many ids") {
+		t.Fatalf("err = %v", err)
+	}
+}

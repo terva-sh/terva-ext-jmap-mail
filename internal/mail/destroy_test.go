@@ -74,7 +74,7 @@ func TestDestroyAlwaysNeedsConfirm(t *testing.T) {
 	s := testService(destroyFake())
 	// Even a single id, even one already in Trash.
 	_, err := s.Destroy(context.Background(), DestroyParams{IDs: []string{"e-trash"}})
-	want := destroyPhrase(DestroyParams{IDs: []string{"e-trash"}})
+	want := destroyPhrase([]string{"e-trash"}, false, "")
 	if err == nil || !strings.Contains(err.Error(), `"`+want+`"`) {
 		t.Fatalf("err = %v, want refusal naming %q", err, want)
 	}
@@ -101,7 +101,7 @@ func TestDestroyDryRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := destroyPhrase(DestroyParams{IDs: []string{"e-trash", "e-inbox", "e-gone"}})
+	want := destroyPhrase([]string{"e-trash", "e-inbox", "e-gone"}, false, "")
 	if res.ConfirmPhrase != want || !strings.Contains(want, "[batch ") {
 		t.Errorf("confirmPhrase = %q, want %q", res.ConfirmPhrase, want)
 	}
@@ -140,7 +140,7 @@ func TestDestroyTrashGate(t *testing.T) {
 	s := testService(destroyFake())
 	// A non-trashed target blocks the whole run.
 	_, err := s.Destroy(context.Background(), DestroyParams{
-		IDs: []string{"e-trash", "e-inbox"}, Confirm: destroyPhrase(DestroyParams{IDs: []string{"e-trash", "e-inbox"}}),
+		IDs: []string{"e-trash", "e-inbox"}, Confirm: destroyPhrase([]string{"e-trash", "e-inbox"}, false, ""),
 	})
 	if err == nil || !strings.Contains(err.Error(), "e-inbox") || !strings.Contains(err.Error(), "email_trash") {
 		t.Fatalf("err = %v, want refusal naming the blocker and the alternative", err)
@@ -154,7 +154,7 @@ func TestDestroyTrashGate(t *testing.T) {
 	f := destroyFake()
 	s2 := testService(f)
 	override := DestroyParams{IDs: []string{"e-trash", "e-inbox"}, AllowNotInTrash: true}
-	override.Confirm = destroyPhrase(override)
+	override.Confirm = destroyPhrase(override.IDs, override.AllowNotInTrash, override.Account)
 	if !strings.Contains(override.Confirm, "including outside Trash") {
 		t.Fatalf("gate-skipping phrase must differ: %q", override.Confirm)
 	}
@@ -171,7 +171,7 @@ func TestDestroyExcludesNotFoundFromSet(t *testing.T) {
 	f := destroyFake()
 	s := testService(f)
 	res, err := s.Destroy(context.Background(), DestroyParams{
-		IDs: []string{"e-trash", "e-gone"}, Confirm: destroyPhrase(DestroyParams{IDs: []string{"e-trash", "e-gone"}}),
+		IDs: []string{"e-trash", "e-gone"}, Confirm: destroyPhrase([]string{"e-trash", "e-gone"}, false, ""),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -190,7 +190,7 @@ func TestDestroyExcludesNotFoundFromSet(t *testing.T) {
 func TestDestroySendsIfInStateFromSnapshot(t *testing.T) {
 	f := destroyFake()
 	s := testService(f)
-	if _, err := s.Destroy(context.Background(), DestroyParams{IDs: []string{"e-trash"}, Confirm: destroyPhrase(DestroyParams{IDs: []string{"e-trash"}})}); err != nil {
+	if _, err := s.Destroy(context.Background(), DestroyParams{IDs: []string{"e-trash"}, Confirm: destroyPhrase([]string{"e-trash"}, false, "")}); err != nil {
 		t.Fatal(err)
 	}
 	set := findBatch(t, f, "Email/set")
@@ -209,7 +209,7 @@ func TestDestroyStateMismatchAbortsWithGuidance(t *testing.T) {
 		return base(calls)
 	}
 	s := testService(f)
-	_, err := s.Destroy(context.Background(), DestroyParams{IDs: []string{"e-trash"}, Confirm: destroyPhrase(DestroyParams{IDs: []string{"e-trash"}})})
+	_, err := s.Destroy(context.Background(), DestroyParams{IDs: []string{"e-trash"}, Confirm: destroyPhrase([]string{"e-trash"}, false, "")})
 	if err == nil || !strings.Contains(err.Error(), "nothing deleted") || !strings.Contains(err.Error(), "dryRun") {
 		t.Fatalf("err = %v, want abort guidance", err)
 	}
@@ -228,7 +228,7 @@ func TestDestroyPartialFailure(t *testing.T) {
 		return base(calls)
 	}
 	s := testService(f)
-	res, err := s.Destroy(context.Background(), DestroyParams{IDs: []string{"e-trash"}, Confirm: destroyPhrase(DestroyParams{IDs: []string{"e-trash"}})})
+	res, err := s.Destroy(context.Background(), DestroyParams{IDs: []string{"e-trash"}, Confirm: destroyPhrase([]string{"e-trash"}, false, "")})
 	if err != nil {
 		t.Fatal(err)
 	}
