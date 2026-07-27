@@ -615,3 +615,55 @@ func TestAggregatesCannotReturnMessages(t *testing.T) {
 		}
 	}
 }
+
+// v0.20.0 shipped with descriptions that had fallen behind the code: the
+// search tool still told the model to pass a selectionId "as selection" — the
+// argument name removed in v0.17.0 — and three places still named 200 and 500
+// as the caps after they became 2,000. None of it broke a call (the aliases
+// resolve and the real caps are enforced), which is exactly why nothing
+// caught it: the model was simply being taught the wrong thing in the release
+// whose headline was the new numbers.
+//
+// Prose cannot be checked in general. These two properties can, and they are
+// the two that were wrong.
+func TestDescriptionsDoNotTeachRetiredArgumentNames(t *testing.T) {
+	surfaces := map[string]string{
+		"contextPolicy": contextPolicy,
+		"descSearch":    descSearch,
+		"descMark":      descMark,
+		"descMove":      descMove,
+		"descTrash":     descTrash,
+		"descDestroy":   descDestroy,
+		"descGet":       descGet,
+		"targetProps":   targetProperties,
+	}
+	for name, text := range surfaces {
+		for _, retired := range []string{"as selection", "as receipt", "selection:<", "receipt:<"} {
+			if strings.Contains(text, retired) {
+				t.Errorf("%s still teaches %q — selection and receipt merged into handle in v0.17.0", name, retired)
+			}
+		}
+	}
+}
+
+// Where a description states a cap, it must state the real one. Checked by
+// searching for the superseded numbers in the places that name caps at all,
+// rather than by parsing prose.
+func TestDescriptionsStateTheRealCaps(t *testing.T) {
+	if !strings.Contains(targetProperties, "2000") {
+		t.Error("targetProperties never mentions the 2000-message handle cap it now permits")
+	}
+	if strings.Contains(targetProperties, "at most 200 from selectionOffset") {
+		t.Error("targetProperties still names 200 as the handle cap")
+	}
+	if strings.Contains(targetProperties, "offsets 0, 200, 400") {
+		t.Error("targetProperties still walks through the pre-v0.20.0 slicing example")
+	}
+	// The page cap and the mutating cap are equal on purpose — that is what
+	// makes one page one apply — so the search surface has to say the number.
+	for name, text := range map[string]string{"descSearch": descSearch, "contextPolicy": contextPolicy} {
+		if !strings.Contains(text, "2000") {
+			t.Errorf("%s never mentions the 2000-id page that returnIds:\"none\" unlocks", name)
+		}
+	}
+}

@@ -120,7 +120,7 @@ const contextPolicy = "The email_* tools read and organize the user's mailboxes 
 	"and no third-party sender names, subject lines or body previews pulled into the session record for a placement " +
 	"check that never needed them. " +
 	"For bulk work ask for less again: email_search fields:[\"id\"] returns a flat ids array and paging " +
-	"metadata only (and raises the page limit to 500), returnIds:\"none\" drops even that array once you are working " +
+	"metadata only (and raises the page limit to 500; returnIds:\"none\" lifts it to 2000), returnIds:\"none\" drops even that array once you are working " +
 	"from the selectionId beside it (returnIds:\"boundaries\" keeps the page's first and last id, enough to check " +
 	"placement afterwards), and organize runs above 20 messages report counts " +
 	"instead of enumerating every message (verbose:true restores the list) — a 200-message batch then costs " +
@@ -204,9 +204,10 @@ const (
 		"Filter by mailbox (role, path, name, or id), text, from/to/cc/bcc, subject, body, date range, attachments, keywords — " +
 		"or pass a raw JMAP filter via filterJson (supports AND/OR/NOT). " +
 		"hasMore reports whether matches remain past the page; includeTotal adds an exact match count. " +
-		"fields projects the result down to the properties you need — fields:[\"id\"] for bulk organization, which also raises the page limit to 500. " +
-		"Results carry a selectionId naming the ids: pass it to email_move / email_mark / email_trash as selection instead of retyping them — " +
-		"and returnIds:\"none\" then drops the id array entirely, since the handle already names the set (returnIds:\"boundaries\" keeps just the first and last, for checking placement afterwards)."
+		"fields projects the result down to the properties you need — fields:[\"id\"] for bulk organization, which raises the page limit to 500. " +
+		"Results carry a selectionId naming the ids: pass it as handle to email_move / email_mark / email_trash / email_destroy instead of retyping them — " +
+		"and returnIds:\"none\" then drops the id array entirely, since the handle already names the set, AND lifts the page to 2000, which is exactly one organize call " +
+		"(returnIds:\"boundaries\" keeps just the first and last, for checking placement afterwards)."
 
 	descCount = "Count several filters at once — one request, one server state, so the rows of a table actually sum. " +
 		"Each query is {label, filter} with email_search's filter surface; the result is [{label, total}] plus the single " +
@@ -464,8 +465,8 @@ func schemaGet() json.RawMessage {
 // selectors. Hence no minItems here. maxItems stays: a real bound, not a floor.
 const targetProperties = `
     "ids": {"type": "array", "items": {"type": "string"}, "maxItems": 200, "description": "Explicit message ids. Prefer handle when the ids came from a search or a dry run you just ran. [] means \"not this way\" and is the same as omitting it."},
-    "handle": {"type": "string", "description": "A selectionId (sel_...) from email_search, or a receiptId (rcp_...) from THIS tool's own dry run — the prefix says which, so the call states which it is using. A selection operates on that search's ids without resending them, at most 200 from selectionOffset. A receipt applies exactly the previewed set and replaces the confirm phrase too, since the dry run already did the previewing; re-presenting one whose result you lost returns the original outcome (replayed:true) rather than acting twice. \"\" means \"not this way\"."},
-    "selectionOffset": {"type": "integer", "minimum": 0, "default": 0, "description": "Where in a sel_ handle to start; ignored for rcp_ ones. A 500-id search feeds three calls at offsets 0, 200, 400 — the ids were pinned at search time, so earlier batches moving mail does not shift the later ones."},`
+    "handle": {"type": "string", "description": "A selectionId (sel_...) from email_search, or a receiptId (rcp_...) from THIS tool's own dry run — the prefix says which, so the call states which it is using. A selection operates on that search's ids without resending them, up to 2000 from selectionOffset — ten times what ids allows, because a handle is one field and the cap on ids bounds argument payload. A receipt applies exactly the previewed set and replaces the confirm phrase too, since the dry run already did the previewing; re-presenting one whose result you lost returns the original outcome (replayed:true) rather than acting twice. \"\" means \"not this way\"."},
+    "selectionOffset": {"type": "integer", "minimum": 0, "default": 0, "description": "Where in a sel_ handle to start; ignored for rcp_ ones. Rarely needed now: a search page and this cap are both 2000, so a whole page is one call. A larger selection is taken at offsets 0, 2000, ... — the ids were pinned at search time, so earlier batches moving mail does not shift the later ones."},`
 
 func schemaMark() json.RawMessage {
 	return json.RawMessage(`{
